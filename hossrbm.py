@@ -238,7 +238,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         cost = cost_fn(pos_g = pos_updates['g'],
                        pos_h = pos_updates['h'],
-                           pos_s = pos_updates['s'],
+                       pos_s = pos_updates['s'],
                        pos_v = self.input,
                        neg_g = neg_updates[self.neg_g],
                        neg_h = neg_updates[self.neg_h],
@@ -248,7 +248,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         ##
         # COMPUTE GRADIENTS WRT. TO ALL COSTS
         ##
-        main_cost = [cost, self.get_reg_cost(self.l2, self.l1)]
+        spcost = self.get_sparsity_cost(pos_updates['g'], pos_updates['h'], pos_updates['s'])
+        regcost = self.get_reg_cost(self.l2, self.l1)
+        main_cost = [cost, spcost, regcost]
         learning_grads = utils_cost.compute_gradients(*main_cost)
 
         ##
@@ -573,14 +575,15 @@ class BilinearSpikeSlabRBM(Model, Block):
     def ml_h_hat(self, g_hat, v):
         return self.h_given_gv(g_hat, v)
 
-    def e_step(self, v, n_steps=1):
+    def e_step(self, v, n_steps=100, eps=1e-5):
         new_g = T.ones((v.shape[0], self.n_g)) * T.nnet.sigmoid(self.gbias)
         new_h = T.ones((v.shape[0], self.n_h)) * T.nnet.sigmoid(self.hbias)
 
         def estep_iteration(g1, h1, v):
             g2 = self.ml_g_hat(h1, v)
             h2 = self.ml_h_hat(g2, v)
-            return [g2, h2]
+            return [g2, h2], theano.scan_module.until(
+                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
 
         [new_g, new_h], updates = theano.scan(
                     estep_iteration,
@@ -626,6 +629,33 @@ class BilinearSpikeSlabRBM(Model, Block):
     ##############################
     # GENERIC OPTIMIZATION STUFF #
     ##############################
+    def get_sparsity_cost(self, pos_g, pos_h, pos_s):
+
+        # update mean activation using exponential moving average
+        hack_g = self.g_given_hv(pos_h, self.input)
+        hack_h = self.h_given_gv(pos_g, self.input)
+
+        # define loss based on value of sp_type
+        eps = npy_floatX(1./self.batch_size)
+        loss = lambda targ, val: - npy_floatX(targ) * T.log(eps + val) \
+                                 - npy_floatX(1-targ) * T.log(1 - val + eps)
+
+        params = []
+        cost = T.zeros((), dtype=floatX)
+        if self.sp_weight['g'] or self.sp_weight['h']:
+            params += [self.Wv, self.alpha, self.mu]
+            if self.sp_weight['g']:
+                cost += self.sp_weight['g']  * T.sum(loss(self.sp_targ['g'], hack_g.mean(axis=0)))
+                params += [self.gbias]
+            if self.sp_weight['h']:
+                cost += self.sp_weight['h']  * T.sum(loss(self.sp_targ['h'], hack_h.mean(axis=0)))
+                params += [self.hbias]
+            if self.flags.get('split_norm', False):
+                params += [self.wv_norms]
+
+        cte = [pos_g, pos_h, pos_s]
+        return utils_cost.Cost(cost, params, cte)
+
     def get_reg_cost(self, l2=None, l1=None):
         """
         Builds the symbolic expression corresponding to first-order gradient descent
@@ -670,6 +700,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans = {}
         chans.update(self.monitor_matrix(self.Wv))
         chans.update(self.monitor_vector(self.wv_norms))
+        chans.update(self.monitor_vector(self.gbias))
         chans.update(self.monitor_vector(self.hbias))
         chans.update(self.monitor_vector(self.alpha_prec, name='alpha_prec'))
         chans.update(self.monitor_vector(self.mu))
