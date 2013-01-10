@@ -126,11 +126,21 @@ class BilinearSpikeSlabRBM(Model, Block):
         assert n_g / bw_g == n_h / bw_h
         self.n_s = (n_g / bw_g) * (bw_g * bw_h)
         
-        self.w_norms = sharedX(1.0 * numpy.ones(self.n_s), name='wv_norms')
+        self.w_norms = sharedX(1.0 * numpy.ones(self.n_s), name='w_norms')
         wv_val =  self.rng.randn(n_v, self.n_s) * iscales['Wv']
         self.Wv = sharedX(wv_val, name='Wv')
-        self.Wg = sharedX(sparse_gmask.mask * iscales.get('Wg', 1.0), name='Wg')
-        self.Wh = sharedX(sparse_hmask.mask * iscales.get('Wh', 1.0), name='Wh')
+
+        if sparse_gmask:
+            self.Wg = sharedX(sparse_gmask.mask * iscales.get('Wg', 1.0), name='Wg')
+        else:
+            wg_val =  self.rng.randn(self.n_s, self.n_g) * iscales['Wg']
+            self.Wg = sharedX(wg_val, name='Wg')
+
+        if sparse_hmask:
+            self.Wh = sharedX(sparse_hmask.mask * iscales.get('Wh', 1.0), name='Wh')
+        else:
+            wh_val =  self.rng.randn(self.n_s, self.n_h) * iscales['Wh']
+            self.Wh = sharedX(wh_val, name='Wh')
  
         # allocate shared variables for bias parameters
         self.gbias = sharedX(iscales['gbias'] * numpy.ones(n_g), name='gbias')
@@ -286,12 +296,22 @@ class BilinearSpikeSlabRBM(Model, Block):
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
         # constraint filters to have unit norm
         if self.flags.get('weight_norm', None):
+            wg = constraint_updates.get(self.Wg, self.Wg)
+            wh = constraint_updates.get(self.Wh, self.Wh)
             wv = constraint_updates.get(self.Wv, self.Wv)
+            wg_norm = T.sqrt(T.sum(wg**2, axis=0))
+            wh_norm = T.sqrt(T.sum(wh**2, axis=0))
             wv_norm = T.sqrt(T.sum(wv**2, axis=0))
             if self.flags['weight_norm'] == 'unit':
                 constraint_updates[self.Wv] = wv / wv_norm
+                if self.flags.get('low_rank', False):
+                    constraint_updates[self.Wg] = wg / wg_norm
+                    constraint_updates[self.Wh] = wh / wh_norm
             elif self.flags['weight_norm'] == 'max_unit':
                 constraint_updates[self.Wv] = wv / wv_norm * T.minimum(wv_norm, 1.0)
+                if self.flags.get('low_rank', False):
+                    constraint_updates[self.Wg] = wg / wg_norm * T.minimum(wg_norm, 1.0)
+                    constraint_updates[self.Wh] = wh / wh_norm * T.minimum(wh_norm, 1.0)
         if self.scalar_b:
             beta = constraint_updates.get(self.beta, self.beta)
             constraint_updates[self.beta] = T.mean(beta) * T.ones_like(beta)
@@ -401,10 +421,28 @@ class BilinearSpikeSlabRBM(Model, Block):
         return T.dot(self.beta_prec * v_sample, Wv)
 
     def from_g(self, g_sample):
-        return T.dot(g_sample, self.Wg.T)
+        WgT = self.Wg.T
+        if self.flags.get('low_rank', False):
+            WgT *= self.w_norm
+        return T.dot(g_sample, WgT)
 
     def from_h(self, h_sample):
-        return T.dot(h_sample, self.Wh.T)
+        WhT = self.Wh.T
+        if self.flags.get('low_rank', False):
+            WhT *= self.w_norm
+        return T.dot(h_sample, WhT)
+
+    def to_g(self, g_s):
+        Wg = self.Wg
+        if self.flags.get('low_rank', False):
+            Wg *= T.shape_padright(self.w_norm)
+        return T.dot(g_s, Wg) + self.gbias
+
+    def to_h(self, h_s):
+        Wh = self.Wh
+        if self.flags.get('low_rank', False):
+            Wh *= T.shape_padright(self.w_norm)
+        return T.dot(h_s, Wh) + self.hbias
 
     def h_given_gv_input(self, g_sample, v_sample):
         """
@@ -416,7 +454,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_g = self.from_g(g_sample)
         h_mean_s = 0.5 * 1./self.alpha_prec * from_g * from_v**2
         h_mean_s += from_g * from_v * self.mu
-        h_mean = T.dot(h_mean_s, self.Wh) + self.hbias
+        h_mean = self.to_h(h_mean_s)
         return h_mean
     
     def h_given_gv(self, g_sample, v_sample):
@@ -444,7 +482,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_h = self.from_h(h_sample)
         g_mean_s = 0.5 * 1./self.alpha_prec * from_h * from_v**2
         g_mean_s += from_h * from_v * self.mu
-        g_mean = T.dot(g_mean_s, self.Wg) + self.gbias
+        g_mean = self.to_g(g_mean_s)
         return g_mean
     
     def g_given_hv(self, h_sample, v_sample):
@@ -757,6 +795,11 @@ class BilinearSpikeSlabRBM(Model, Block):
     def get_monitoring_channels(self, x, y=None):
         chans = {}
         chans.update(self.monitor_matrix(self.Wv))
+        if self.flags.get('low_rank', False):
+            chans.update(self.monitor_matrix(self.Wg))
+            chans.update(self.monitor_matrix(self.Wh))
+        chans.update(self.monitor_matrix(self.Wg))
+        chans.update(self.monitor_matrix(self.Wh))
         chans.update(self.monitor_vector(self.w_norms))
         chans.update(self.monitor_vector(self.gbias))
         chans.update(self.monitor_vector(self.hbias))
@@ -767,6 +810,14 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_matrix(self.neg_h))
         chans.update(self.monitor_matrix(self.neg_s))
         chans.update(self.monitor_matrix(self.neg_v))
+        wg_norms = T.sqrt(T.sum(self.Wg**2, axis=0))
+        chans['wg_norm.mean'] = T.mean(wg_norms)
+        chans['wg_norm.max'] = T.max(wg_norms)
+        chans['wg_norm.min'] = T.min(wg_norms)
+        wh_norms = T.sqrt(T.sum(self.Wh**2, axis=0))
+        chans['wh_norm.mean'] = T.mean(wh_norms)
+        chans['wh_norm.max'] = T.max(wh_norms)
+        chans['wh_norm.min'] = T.min(wh_norms)
         wv_norms = T.sqrt(T.sum(self.Wv**2, axis=0))
         chans['wv_norm.mean'] = T.mean(wv_norms)
         chans['wv_norm.max'] = T.max(wv_norms)
