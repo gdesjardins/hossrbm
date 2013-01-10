@@ -344,9 +344,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param v_sample: T.matrix of shape (batch_size, n_v)
         """
         Wv = self.w_norms * self.Wv
-        from_v = T.dot(self.beta_prec * v_sample, Wv)
-        from_h = T.dot(h_sample, self.Wh.T)
-        from_g = T.dot(g_sample, self.Wg.T)
+        from_v = self.from_v(v_sample)
+        from_h = self.from_h(h_sample)
+        from_g = self.from_g(g_sample)
         energy = -T.sum(s_sample * from_g * from_h * from_v, axis=1)
         if s_squared is None:
             energy += T.sum(0.5 * self.alpha_prec * s_sample**2, axis=1)
