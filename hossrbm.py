@@ -423,25 +423,25 @@ class BilinearSpikeSlabRBM(Model, Block):
     def from_g(self, g_sample):
         WgT = self.Wg.T
         if self.flags.get('low_rank', False):
-            WgT *= self.w_norm
+            WgT *= self.w_norms
         return T.dot(g_sample, WgT)
 
     def from_h(self, h_sample):
         WhT = self.Wh.T
         if self.flags.get('low_rank', False):
-            WhT *= self.w_norm
+            WhT *= self.w_norms
         return T.dot(h_sample, WhT)
 
     def to_g(self, g_s):
         Wg = self.Wg
         if self.flags.get('low_rank', False):
-            Wg *= T.shape_padright(self.w_norm)
+            Wg *= T.shape_padright(self.w_norms)
         return T.dot(g_s, Wg) + self.gbias
 
     def to_h(self, h_s):
         Wh = self.Wh
         if self.flags.get('low_rank', False):
-            Wh *= T.shape_padright(self.w_norm)
+            Wh *= T.shape_padright(self.w_norms)
         return T.dot(h_s, Wh) + self.hbias
 
     def h_given_gv_input(self, g_sample, v_sample):
@@ -511,10 +511,21 @@ class BilinearSpikeSlabRBM(Model, Block):
         s_mean = self.s_given_ghv(g_sample, h_sample, v_sample)
         
         rng = self.theano_rng if rng is None else rng
-        s_sample = rng.normal(
-                size=(self.batch_size, self.n_s),
-                avg = s_mean, 
-                std = T.sqrt(1./self.alpha_prec), dtype=floatX)
+
+        if self.flags.get('truncate_s', False):
+            s_sample = truncated.truncated_normal(
+                    size=(self.batch_size, self.n_s),
+                    avg = s_mean, 
+                    std = T.sqrt(1./self.alpha_prec),
+                    lbound = self.mu - self.vbound,
+                    ubound = self.mu + self.vbound,
+                    theano_rng = rng,
+                    dtype=floatX)
+        else: 
+            s_sample = rng.normal(
+                    size=(self.batch_size, self.n_s),
+                    avg = s_mean, 
+                    std = T.sqrt(1./self.alpha_prec), dtype=floatX)
         return s_sample
 
     def v_given_ghs(self, g_sample, h_sample, s_sample):
