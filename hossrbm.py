@@ -47,8 +47,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.neg_ev.set_value(model.neg_ev.get_value())
         self.neg_s.set_value(model.neg_s.get_value())
         self.neg_h.set_value(model.neg_h.get_value())
-        self.sp_pos_v.set_value(model.sp_pos_v.get_value())
-        self.sp_pos_h.set_value(model.sp_pos_h.get_value())
         # sync random number generators
         self.rng.set_state(model.rng.get_state())
         self.theano_rng.rstate = model.theano_rng.rstate
@@ -65,7 +63,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def __init__(self, 
             numpy_rng = None, theano_rng = None,
-            n_g=99, n_h=99, bw_g=3, bw_h=3, n_v=100, init_from=None,
+            n_g=99, n_h=99, n_s=None, bw_g=3, bw_h=3, n_v=100, init_from=None,
             sparse_gmask = None, sparse_hmask = None,
             pos_mf_steps=1, pos_sample_steps=0, neg_sample_steps=1,
             lr=None, lr_timestamp=None, lr_mults = {},
@@ -124,52 +122,13 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         ############### ALLOCATE PARAMETERS #################
         assert n_g / bw_g == n_h / bw_h
-        self.n_s = (n_g / bw_g) * (bw_g * bw_h)
-        
-        self.w_norms = sharedX(1.0 * numpy.ones(self.n_s), name='w_norms')
-        wv_val =  self.rng.randn(n_v, self.n_s) * iscales['Wv']
-        self.Wv = sharedX(wv_val, name='Wv')
+        self.n_s = n_s if n_s else (n_g / bw_g) * (bw_g * bw_h)
 
-        if sparse_gmask:
-            self.Wg = sharedX(sparse_gmask.mask * iscales.get('Wg', 1.0), name='Wg')
-        else:
-            wg_val =  self.rng.randn(self.n_s, self.n_g) * iscales['Wg']
-            self.Wg = sharedX(wg_val, name='Wg')
-
-        if sparse_hmask:
-            self.Wh = sharedX(sparse_hmask.mask * iscales.get('Wh', 1.0), name='Wh')
-        else:
-            wh_val =  self.rng.randn(self.n_s, self.n_h) * iscales['Wh']
-            self.Wh = sharedX(wh_val, name='Wh')
- 
-        # allocate shared variables for bias parameters
-        self.gbias = sharedX(iscales['gbias'] * numpy.ones(n_g), name='gbias')
-        self.hbias = sharedX(iscales['hbias'] * numpy.ones(n_h), name='hbias')
-
-        # mean (mu) and precision (alpha) parameters on s
-        self.mu = sharedX(iscales['mu'] * numpy.ones(self.n_s), name='mu')
-        self.alpha = sharedX(iscales['alpha'] * numpy.ones(self.n_s), name='alpha')
-        var_param_func = {'exp': T.exp,
-                          'softplus': T.nnet.softplus,
-                          'linear': lambda x: x}
-        self.alpha_prec = var_param_func[self.var_param_alpha](self.alpha)
-
-        # diagonal of precision matrix of visible units
+        # allocate symbolic variable for input
+        self.input = T.matrix('input')
         self.vbound = sharedX(vbound, name='vbound')
-        self.beta = sharedX(iscales['beta'] * numpy.ones(n_v), name='beta')
-        self.beta_prec = var_param_func[self.var_param_beta](self.beta)
-
-        # allocate shared variable for persistent chain
-        self.neg_v  = sharedX(self.rng.rand(batch_size, n_v), name='neg_v')
-        self.neg_ev = sharedX(self.rng.rand(batch_size, n_v), name='neg_ev')
-        self.neg_s  = sharedX(self.rng.rand(batch_size, self.n_s), name='neg_s')
-        self.neg_h  = sharedX(self.rng.rand(batch_size, n_h), name='neg_h')
-        self.neg_g  = sharedX(self.rng.rand(batch_size, n_g), name='neg_g')
-       
-        # moving average values for sparsity
-        self.sp_pos_v = sharedX(self.rng.rand(1,self.n_v), name='sp_pos_v')
-        self.sp_pos_h = sharedX(self.rng.rand(1,self.n_h), name='sp_pos_h')
-        self.sp_pos_g = sharedX(self.rng.rand(1,self.n_g), name='sp_pos_g')
+        self.init_parameters()
+        self.init_chains()
 
         # learning rate, with deferred 1./t annealing
         self.iter = sharedX(0.0, name='iter')
@@ -193,10 +152,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             self.lr_mults_it[k] = tools.HyperParamIterator(lr_timestamp, lr_mults[k])
             self.lr_mults_shrd[k] = sharedX(self.lr_mults_it[k].value, 
                                             name='lr_mults_shrd'+k)
-
-        # allocate symbolic variable for input
-        self.input = T.matrix('input')
-        
+       
         # configure input-space (new pylearn2 feature?)
         self.input_space = VectorSpace(n_v)
         self.output_space = VectorSpace(n_h)
@@ -213,6 +169,47 @@ class BilinearSpikeSlabRBM(Model, Block):
         if init_from:
             self.load_params(init_from)
 
+    def init_parameters(self):
+        self.w_norms = sharedX(1.0 * numpy.ones(self.n_s), name='w_norms')
+        wv_val =  self.rng.randn(self.n_v, self.n_s) * self.iscales['Wv']
+        self.Wv = sharedX(wv_val, name='Wv')
+
+        if self.sparse_gmask:
+            self.Wg = sharedX(self.sparse_gmask.mask * self.iscales.get('Wg', 1.0), name='Wg')
+        else:
+            wg_val =  self.rng.randn(self.n_s, self.n_g) * self.iscales['Wg']
+            self.Wg = sharedX(wg_val, name='Wg')
+
+        if self.sparse_hmask:
+            self.Wh = sharedX(self.sparse_hmask.mask * self.iscales.get('Wh', 1.0), name='Wh')
+        else:
+            wh_val =  self.rng.randn(self.n_s, self.n_h) * self.iscales['Wh']
+            self.Wh = sharedX(wh_val, name='Wh')
+ 
+        # allocate shared variables for bias parameters
+        self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
+        self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
+
+        # mean (mu) and precision (alpha) parameters on s
+        self.mu = sharedX(self.iscales['mu'] * numpy.ones(self.n_s), name='mu')
+        self.alpha = sharedX(self.iscales['alpha'] * numpy.ones(self.n_s), name='alpha')
+        var_param_func = {'exp': T.exp,
+                          'softplus': T.nnet.softplus,
+                          'linear': lambda x: x}
+        self.alpha_prec = var_param_func[self.var_param_alpha](self.alpha)
+
+        # diagonal of precision matrix of visible units
+        self.beta = sharedX(self.iscales['beta'] * numpy.ones(self.n_v), name='beta')
+        self.beta_prec = var_param_func[self.var_param_beta](self.beta)
+
+    def init_chains(self):
+        """ Allocate shared variable for persistent chain """
+        self.neg_v  = sharedX(self.rng.rand(self.batch_size, self.n_v), name='neg_v')
+        self.neg_ev = sharedX(self.rng.rand(self.batch_size, self.n_v), name='neg_ev')
+        self.neg_s  = sharedX(self.rng.rand(self.batch_size, self.n_s), name='neg_s')
+        self.neg_h  = sharedX(self.rng.rand(self.batch_size, self.n_h), name='neg_h')
+        self.neg_g  = sharedX(self.rng.rand(self.batch_size, self.n_g), name='neg_g')
+ 
     def params(self):
         """
         Returns a list of learnt model parameters.
