@@ -1,10 +1,13 @@
 import numpy
 from pylearn2.datasets import dense_design_matrix
 
-kernel = numpy.asarray(
-            [[1,0,1],
-             [0,1,0],
-             [1,0,1]])
+kernels = numpy.asarray(
+        [[[1,1,1], [1,0,1], [1,1,1]],
+         [[1,0,1], [0,1,0], [1,0,1]],
+         [[0,1,0], [1,1,1], [0,1,0]],
+         [[1,1,1], [0,0,0], [1,1,1]],
+         [[1,0,1], [1,0,1], [1,0,1]]],
+        dtype='float32')
 
 class NoisyColorToyData(dense_design_matrix.DenseDesignMatrix):
 
@@ -12,34 +15,29 @@ class NoisyColorToyData(dense_design_matrix.DenseDesignMatrix):
 
         self.rng = numpy.random.RandomState(seed)
 
-        n = 3 # colors
-        m = 5 # positions
-        width  = len(kernel[0])
-        height = len(kernel)
-        cols   = (width + 1)*m
+        n_cols = 3 # colors
+        m_pos = 5 # positions
+        width  = len(kernels[0][0])
+        height = len(kernels[0])
+        cols   = (width + 1)*m_pos
         rows   = height
 
-        X = numpy.zeros(( (2**m)*(2**n), rows*cols*n),dtype='float32')
+        X = numpy.zeros(((2**m_pos)*(2**n_cols), n_cols*rows*cols),dtype='float32')
         noisyX = numpy.zeros((1000*X.shape[0], X.shape[1]), dtype='float32')
 
         idx = 0
-        for i in numpy.ndindex(*([2]*m)):
-            for j in numpy.ndindex(*([2]*n)):
+        # generate a configuration of (g,h)
+        for h in numpy.ndindex(*([2]*m_pos)):
+            for g in numpy.ndindex(*([2]*n_cols)):
+                example = numpy.zeros((n_cols,rows,cols),dtype='float32')
+                for i in xrange(n_cols):
+                    for j in xrange(m_pos):
+                        c = j*(width+1)
+                        example[i, :, c:c+width] += g[i] * h[j] * kernels[j]
 
-                example = numpy.zeros((n,rows,cols),dtype='float32')
-                template = numpy.zeros((n,rows,width))
-
-                for k in xrange(m):
-
-                    c = k * (width+1)
-
-                    if i[k]:
-                        template[0,:,:] = j[0] * kernel
-                        template[1,:,:] = j[1] * kernel
-                        template[2,:,:] = j[2] * kernel
-                        example[:, 0:rows, c:c+width] = template
-
-                X[idx,:] = example.reshape(rows * cols * n)
+                scale = self.rng.normal(1.0, 0.1)
+                sign = self.rng.randint(0,2.)*2 - 1.
+                X[idx,:] = sign * scale * example.reshape(rows * cols * n_cols)
 
                 idx += 1
 
@@ -52,6 +50,66 @@ class NoisyColorToyData(dense_design_matrix.DenseDesignMatrix):
         if center:
             noisyX -= numpy.mean(noisyX, axis=0)
 
-        super(NoisyColorToyData2,self).__init__(X = noisyX, view_converter = view_converter)
+        super(NoisyColorToyData,self).__init__(X = noisyX, view_converter = view_converter)
 
         assert not numpy.any(numpy.isnan(self.X))
+
+kernels2 = numpy.asarray(
+            [[[0,0,0,0,0,0,0],
+              [0,0,0,0,0,0,0],
+              [0,0,0,0,0,0,0],
+              [0,0,0,0,0,0,0],
+              [0,0,0,0,0,0,0],
+              [0,0,0,0,0,0,0],
+              [0,0,0,0,0,0,0]],
+             [[1,0,0,0,0,0,1],
+              [0,1,0,0,0,1,0],
+              [0,0,1,0,1,0,0],
+              [0,0,0,1,0,0,0],
+              [0,0,1,0,1,0,0],
+              [0,1,0,0,0,1,0],
+              [1,0,0,0,0,0,1]],
+             [[1,1,1,1,1,1,1],
+              [1,0,0,0,0,0,1],
+              [1,0,0,0,0,0,1],
+              [1,0,0,0,0,0,1],
+              [1,0,0,0,0,0,1],
+              [1,0,0,0,0,0,1],
+              [1,1,1,1,1,1,1]],
+             [[0,0,0,1,0,0,0],
+              [0,0,0,1,0,0,0],
+              [0,0,0,1,0,0,0],
+              [1,1,1,1,1,1,1],
+              [0,0,0,1,0,0,0],
+              [0,0,0,1,0,0,0],
+              [0,0,0,1,0,0,0]]])
+
+class SuperImposedShapes(dense_design_matrix.DenseDesignMatrix):
+
+    def __init__(self):
+
+        n = 3 # colors
+        m = len(kernels2)
+        (h, w) = kernels2[0].shape
+        X = numpy.zeros(( (2**m)*(2**n), w*h*3),dtype='float32')
+        idx = 0
+        for i in numpy.ndindex(*([2]*m)):
+            for j in numpy.ndindex(*([2]*n)):
+
+                example = numpy.zeros((n,h,w), dtype='float32')
+                for k in xrange(m):
+                    if i[k]:
+                        example[0,:,:] += j[0] * kernels2[k]
+                        example[1,:,:] += j[1] * kernels2[k]
+                        example[2,:,:] += j[2] * kernels2[k]
+
+                X[idx,:] = example.reshape(h * w * n)
+                idx += 1
+
+        view_converter = dense_design_matrix.DefaultViewConverter((h,w,1))
+
+        super(SuperImposedShapes,self).__init__(X = X, view_converter = view_converter)
+
+        assert not numpy.any(numpy.isnan(self.X))
+
+
