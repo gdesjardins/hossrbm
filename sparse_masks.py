@@ -32,7 +32,7 @@ class SparsityMask(object):
             mask[si:si+bw_h, gi] = 1.
             si += bw_h
 
-        return SparsityMask(mask, n_g=n_g, n_h=n_h, bw_g=bw_g, bw_h=bw_h)
+        return SparsityMask(mask.T, n_g=n_g, n_h=n_h, bw_g=bw_g, bw_h=bw_h)
 
     @classmethod
     def unfactored_h(cls, n_g, n_h, bw_g, bw_h):
@@ -55,4 +55,4 @@ class SparsityMask(object):
             bi = hi / bw_h
             mask[bi*ds + hi%bw_h:(bi+1)*ds:bw_h, hi] = 1.
 
-        return SparsityMask(mask, n_g=n_g, n_h=n_h, bw_g=bw_g, bw_h=bw_h)
+        return SparsityMask(mask.T, n_g=n_g, n_h=n_h, bw_g=bw_g, bw_h=bw_h)
