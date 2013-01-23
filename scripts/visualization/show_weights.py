@@ -98,30 +98,28 @@ def plot(w):
 
     for chan_i in xrange(nplots):
 
+        viewer_dims = slice(0, None) if opts.color else chan_i
+
         for bidx in xrange(nblocks):
 
             for fidx in xrange(filters_per_block):
-
                 fi = bidx * filters_per_block + fidx
                 topo_view = view_converter.design_mat_to_topo_view(w[fi:fi+1,:])
-
-                if opts.color:
-                    # display all 3 channels in one color image
-                    block_viewer.add_patch(topo_view[0])
-                else:
-                    # display channels separately
-                    block_viewer.add_patch(topo_view[0,:,:,chan_i])
+                try:
+                    block_viewer.add_patch(topo_view[0,:,:,viewer_dims])
+                except:
+                    import pdb; pdb.set_trace()
 
             if opts.splitblocks:
-                pl.imshow(block_viewer.image, interpolation=None)
+                pl.imshow(block_viewer.image, interpolation='nearest')
                 pl.axis('off')
                 pl.title('Wv - block %i, chan %i' % (bidx, chan_i))
                 pl.savefig('filters/filters_chan%i_block%i.png' % (bidx, chan_i))
 
-            chan_viewer.add_patch(block_viewer.image - 0.5)
+            chan_viewer.add_patch(block_viewer.image[:,:,viewer_dims] - 0.5)
             block_viewer.clear()
 
-        main_viewer.add_patch(chan_viewer.image - 0.5)
+        main_viewer.add_patch(chan_viewer.image[:,:,viewer_dims] - 0.5)
         chan_viewer.clear()
 
     return copy.copy(main_viewer.image)
@@ -138,11 +136,13 @@ viewer = PatchViewer((1,nplots),
             is_color = opts.color,
             pad=(20,20))
 
-viewer.add_patch(w_image - 0.5)
+viewer_dims = slice(0, None) if opts.color else 0
+viewer.add_patch(w_image[:,:, viewer_dims] - 0.5)
 if opts.phi:
-    viewer.add_patch(phi_image - 0.5)
+    viewer_dims = slice(0, None) if opts.color else 1
+    viewer.add_patch(phi_image[:,:,0] - 0.5)
 
-pl.imshow(viewer.image, interpolation=None)
+pl.imshow(viewer.image, interpolation='nearest')
 pl.savefig('filters_%s.png' % opts.path)
 pl.close()
 

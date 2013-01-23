@@ -9,6 +9,8 @@ from pylearn2.gui.patch_viewer import make_viewer
 
 from DBM import sharedX, floatX, npy_floatX
 
+def softplus(x): return numpy.log(1. + numpy.exp(x))
+
 parser = OptionParser()
 parser.add_option('-m', '--model', action='store', type='string', dest='path')
 parser.add_option('--width',  action='store', type='int', dest='width')
@@ -35,8 +37,13 @@ neg_updates = model.neg_sampling_updates()
 sample_neg_func = theano.function([], [], updates=neg_updates)
 
 if opts.random:
-    temp = numpy.random.randint(0,2, size=model.nvis.get_value().shape)
-    nvis.set_value(temp.astype(floatX))
+    temp = numpy.random.randint(0,2, size=model.neg_g.get_value().shape)
+    model.neg_g.set_value(temp.astype('float32'))
+    temp = numpy.random.randint(0,2, size=model.neg_h.get_value().shape)
+    model.neg_h.set_value(temp.astype('float32'))
+    v_std = numpy.sqrt(1./softplus(model.beta.get_value()))
+    temp = numpy.random.normal(0, v_std, size=model.neg_v.get_value().shape)
+    model.neg_v.set_value(temp.astype('float32'))
 
 # Burnin of Markov chain.
 for i in xrange(opts.burnin):
