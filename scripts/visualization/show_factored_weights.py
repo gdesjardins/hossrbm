@@ -42,8 +42,8 @@ viewdims = slice(0, None) if opts.color else 0
 
 # load model and retrieve parameters
 model = serial.load(opts.path)
-wg = model.Wg.get_value().T
-wh = model.Wh.get_value().T
+wg = model.Wg.get_value()
+wh = model.Wh.get_value()
 wv = model.Wv.get_value().T
 
 wv_viewer = PatchViewer(get_dims(len(wv)), (opts.height, opts.width),
