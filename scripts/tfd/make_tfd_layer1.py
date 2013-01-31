@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--model', help='Path of model .pkl file.')
 args = parser.parse_args()
 
+"""
 print 'Processing unlabeled set...'
 in_dset_fname = '%s/%s.pkl' % (indir, 'unlabeled')
 out_dset_fname = '%s/%s.pkl' % (outdir, 'unlabeled')
@@ -26,6 +27,7 @@ featext.run(args.model,
         pool_width = 12,
         output_width = 9216,
         output_file = out_dset_fname)
+"""
 
 for fold_i in xrange(0, 4):
 
