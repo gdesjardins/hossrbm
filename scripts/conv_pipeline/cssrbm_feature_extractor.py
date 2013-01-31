@@ -6,6 +6,7 @@ import theano
 import theano.tensor as T
 from theano.tensor.nnet import conv
 from theano.tensor.signal import downsample
+from theano.printing import Print
 
 class FeedForwardConvSSRBM():
 
@@ -17,23 +18,27 @@ class FeedForwardConvSSRBM():
         batch_size = batch_size if batch_size else model.batch_size
 
         image_shape = (batch_size,) + image_shape
-        patch_shape = (model.n_h,) + patch_shape
+        filter_shape = (model.n_h,) + patch_shape
 
         input   = model.input.reshape(image_shape)
-        filters = model.Wv.T.reshape(patch_shape)
-        alpha = model.alpha.dimshuffle(('x', 0, 'x', 'x'))
+        filters = model.Wv.T.reshape(filter_shape)
+        alpha_prec = T.nnet.softplus(model.alpha)
+        alpha_prec = alpha_prec.dimshuffle(('x', 0, 'x', 'x'))
         mu = model.mu.dimshuffle(('x', 0, 'x', 'x'))
         hbias = model.hbias.dimshuffle(('x', 0, 'x', 'x'))
 
         from_v = conv.conv2d(input = input,
-                filters = filters,
-                filter_shape = patch_shape,
+                filters = filters[:,:,::-1,::-1],
+                filter_shape = filter_shape,
                 image_shape = image_shape)
+        self.fromv_func = theano.function([model.input], from_v)
         
-        h_mean  = 0.5 * 1./alpha * from_v**2
+        h_mean  = 0.5 * 1./alpha_prec * from_v**2
         h_mean += from_v * mu
         h_mean += hbias
         conv_out = T.nnet.sigmoid(h_mean)
+        
+        self.convout_func = theano.function([model.input], conv_out)
 
         maxpool_out = downsample.max_pool_2d(conv_out, pool_shape)
 
