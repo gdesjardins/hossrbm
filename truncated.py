@@ -21,12 +21,14 @@ def truncated_normal(size, avg, std, lbound, ubound, theano_rng, dtype):
     u = theano_rng.uniform(size=size, dtype=dtype)
 
     cdf_range = phi(ubound) - phi(lbound)
+    sample = phi_inv(phi(lbound) + u * cdf_range)
 
     # if avg >> ubound, return ubound
     # if avg << lbound, return lbound
     # else return phi(lbound) + u * [phi(ubound) - phi(lbound)]
-    rval = T.switch(cdf_range > 1e-5,
-            phi_inv(phi(lbound) + u * cdf_range),
-            T.switch(avg >= ubound, ubound, lbound))
+    rval = T.switch(
+                T.or_(sample < lbound, sample > ubound),
+                T.switch(avg >= ubound, ubound, lbound),
+                sample)
 
     return rval
