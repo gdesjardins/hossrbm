@@ -189,11 +189,8 @@ class BilinearGaussianRBM(Model, Block):
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
 
         # diagonal of precision matrix of visible units
-        var_param_func = {'exp': T.exp,
-                          'softplus': T.nnet.softplus,
-                          'linear': lambda x: x}
         self.beta = sharedX(self.iscales['beta'] * numpy.ones(self.n_v), name='beta')
-        self.beta_prec = var_param_func[self.var_param_beta](self.beta)
+        self.beta_prec = T.nnet.softplus(self.beta)
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
@@ -465,7 +462,7 @@ class BilinearGaussianRBM(Model, Block):
         Wv = self.scalar_norms * self.Wv if self.flags['split_norm'] else self.Wv
         from_g = self.from_g(g_sample)
         from_h = self.from_h(h_sample)
-        v_mean = 1./self.beta_prec * T.dot(from_g * from_h, Wv.T)
+        v_mean = T.dot(from_g * from_h, Wv.T)
         return v_mean
 
     def sample_v_given_gh(self, g_sample, h_sample, rng=None):
@@ -647,7 +644,7 @@ class BilinearGaussianRBM(Model, Block):
         cost = - minus_cost / self.batch_size
 
         # build gradient of cost with respect to model parameters
-        cte = [pos_g, pos_h, pos_v, s_squared, neg_g, neg_h, neg_v]
+        cte = [pos_g, pos_h, pos_v, neg_g, neg_h, neg_v]
 
         return costmod.Cost(cost, self.params(), cte)
 
