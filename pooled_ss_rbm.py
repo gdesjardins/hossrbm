@@ -23,7 +23,6 @@ from pylearn2.models.model import Model
 from pylearn2.space import VectorSpace
 
 from utils import tools
-from utils import rbm_utils
 from utils import cost as utils_cost
 from utils import sharedX, floatX, npy_floatX
 import truncated
@@ -68,7 +67,8 @@ class PooledSpikeSlabRBM(Model, Block):
         flags.setdefault('norm_type', None)
         flags.setdefault('truncated_normal', False)
         flags.setdefault('no_beta_interaction', False)
-        if len(flags.keys()) != 6:
+        flags.setdefault('scalar_lambd', False)
+        if len(flags.keys()) != 7:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
@@ -82,7 +82,6 @@ class PooledSpikeSlabRBM(Model, Block):
             var_param_alpha='exp', var_param_lambd='linear',
             sp_type='kl', sp_weight={}, sp_targ={},
             batch_size = 13,
-            scalar_b = False,
             compile=True,
             debug=False,
             seed=1241234,
@@ -271,17 +270,10 @@ class PooledSpikeSlabRBM(Model, Block):
 
         # enforce constraints function
         constraint_updates = OrderedDict() 
-        constraint_updates[self.scalar_norms] = T.maximum(1.0, self.scalar_norms)
-        ## clip parameters to maximum values (if applicable)
-        for (k,v) in self.clip_max.iteritems():
-            assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
-            constraint_updates[param] = T.clip(param, param, v)
-        ## clip parameters to minimum values (if applicable)
-        for (k,v) in self.clip_min.iteritems():
-            assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
-            constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
+
+        if self.flags['scalar_lambd']:
+            constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
+
         # constraint filters to have unit norm
         if self.flags['norm_type'] in ('unit', 'max_unit'):
             wv = constraint_updates.get(self.Wv, self.Wv)
@@ -290,9 +282,20 @@ class PooledSpikeSlabRBM(Model, Block):
                 constraint_updates[self.Wv] = wv / wv_norm
             elif self.flags['norm_type'] == 'max_unit':
                 constraint_updates[self.Wv] = wv / wv_norm * T.minimum(wv_norm, 1.0)
-        if self.scalar_b:
-            lambd = constraint_updates.get(self.lambd, self.lambd)
-            constraint_updates[self.lambd] = T.mean(lambd) * T.ones_like(lambd)
+
+        constraint_updates[self.scalar_norms] = T.maximum(1.0, self.scalar_norms)
+        ## clip parameters to maximum values (if applicable)
+        for (k,v) in self.clip_max.iteritems():
+            assert k in [param.name for param in self.params()]
+            param = constraint_updates.get(k, getattr(self, k))
+            constraint_updates[param] = T.clip(param, param, v)
+
+        ## clip parameters to minimum values (if applicable)
+        for (k,v) in self.clip_min.iteritems():
+            assert k in [param.name for param in self.params()]
+            param = constraint_updates.get(k, getattr(self, k))
+            constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
+
         self.enforce_constraints = theano.function([],[], updates=constraint_updates)
 
         ###### All fields you don't want to get pickled should be created above this line
