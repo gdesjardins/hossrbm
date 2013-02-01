@@ -64,11 +64,12 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def validate_flags(self, flags):
         flags.setdefault('enable_centering', False)
+        flags.setdefault('scalar_lambd', False)
         flags.setdefault('truncate_s', False)
         flags.setdefault('truncate_v', False)
         flags.setdefault('norm_type', None)
         flags.setdefault('no_beta_interaction', False)
-        if len(flags.keys()) != 5:
+        if len(flags.keys()) != 6:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
@@ -305,7 +306,10 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         # enforce constraints function
         constraint_updates = OrderedDict() 
-        constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
+
+        if self.flags['scalar_lambd']:
+            constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
+
         norm_wg = T.sqrt(T.sum(self.Wg**2, axis=0))
         norm_wh = T.sqrt(T.sum(self.Wh**2, axis=0))
         norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
@@ -328,13 +332,13 @@ class BilinearSpikeSlabRBM(Model, Block):
         ## clip parameters to maximum values (if applicable)
         for (k,v) in self.clip_max.iteritems():
             assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
+            param = constraint_updates.get(k, getattr(self, k))
             constraint_updates[param] = T.clip(param, param, v)
 
         ## clip parameters to minimum values (if applicable)
         for (k,v) in self.clip_min.iteritems():
             assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
+            param = constraint_updates.get(k, getattr(self, k))
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
         
         self.enforce_constraints = theano.function([],[], updates=constraint_updates)
