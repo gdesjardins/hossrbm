@@ -238,7 +238,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         ###### All fields you don't want to get pickled (e.g., theano functions) should be created below this line
         # SAMPLING: NEGATIVE PHASE
         neg_updates = self.neg_sampling_updates(n_steps=self.neg_sample_steps, use_pcd=True)
-        self.sample_func = theano.function([], [], updates=neg_updates)
 
         # VARIATIONAL E-STEP
         pos_updates = OrderedDict()
