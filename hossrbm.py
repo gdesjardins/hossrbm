@@ -63,11 +63,11 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.iter.set_value(model.iter.get_value())
 
     def validate_flags(self, flags):
-        flags.setdefault('enable_centering', False)
+        flags.setdefault('scalar_lambd', False)
         flags.setdefault('truncate_s', False)
         flags.setdefault('truncate_v', False)
         flags.setdefault('norm_type', None)
-        flags.setdefault('no_beta_interaction', False)
+        flags.setdefault('lambd_interaction', False)
         if len(flags.keys()) != 5:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
@@ -133,7 +133,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.input = T.matrix('input')
         self.init_parameters()
         self.init_chains()
-        self.init_centering()
 
         # learning rate, with deferred 1./t annealing
         self.iter = sharedX(0.0, name='iter')
@@ -206,11 +205,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         # diagonal of precision matrix of visible units
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
         self.lambd_prec = T.nnet.softplus(self.lambd)
-
-    def init_centering(self):
-        def sigm(x): return 1./(1. + numpy.exp(-x))
-        self.goffs = sharedX(sigm(self.gbias.get_value()), name='goffs')
-        self.hoffs = sharedX(sigm(self.hbias.get_value()), name='hoffs')
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
@@ -305,7 +299,10 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         # enforce constraints function
         constraint_updates = OrderedDict() 
-        constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
+
+        if self.flags['scalar_lambd']:
+            constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
+
         norm_wg = T.sqrt(T.sum(self.Wg**2, axis=0))
         norm_wh = T.sqrt(T.sum(self.Wh**2, axis=0))
         norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
@@ -328,13 +325,13 @@ class BilinearSpikeSlabRBM(Model, Block):
         ## clip parameters to maximum values (if applicable)
         for (k,v) in self.clip_max.iteritems():
             assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
+            param = constraint_updates.get(k, getattr(self, k))
             constraint_updates[param] = T.clip(param, param, v)
 
         ## clip parameters to minimum values (if applicable)
         for (k,v) in self.clip_min.iteritems():
             assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
+            param = constraint_updates.get(k, getattr(self, k))
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
         
         self.enforce_constraints = theano.function([],[], updates=constraint_updates)
@@ -377,12 +374,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param s_sample: T.matrix of shape (batch_size, n_s)
         :param v_sample: T.matrix of shape (batch_size, n_v)
         """
-        cg_sample = g_sample - self.goffs if self.flags['enable_centering'] else g_sample
-        ch_sample = h_sample - self.hoffs if self.flags['enable_centering'] else h_sample
-
         from_v = self.from_v(v_sample)
-        from_h = self.from_h(ch_sample)
-        from_g = self.from_g(cg_sample)
+        from_h = self.from_h(h_sample)
+        from_g = self.from_g(g_sample)
         energy = -T.sum(s_sample * from_g * from_h * from_v, axis=1)
         if s_squared is None:
             energy += T.sum(0.5 * self.alpha_prec * s_sample**2, axis=1)
@@ -391,15 +385,14 @@ class BilinearSpikeSlabRBM(Model, Block):
         energy -= T.sum(self.alpha_prec * self.mu * s_sample * from_g * from_h, axis=1)
         energy += T.sum(0.5 * self.alpha_prec * self.mu**2 * from_g * from_h, axis=1)
         energy += T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
-        energy -= T.dot(cg_sample, self.gbias)
-        energy -= T.dot(ch_sample, self.hbias)
+        energy -= T.dot(g_sample, self.gbias)
+        energy -= T.dot(h_sample, self.hbias)
         return energy
 
     def __call__(self, v, output_type='g+h'):
         print 'Building representation with %s' % output_type
         #[g, h, s] = self.e_step(v, n_steps=self.pos_mf_steps)
 
-        import pdb; pdb.set_trace()
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
@@ -442,10 +435,10 @@ class BilinearSpikeSlabRBM(Model, Block):
         Wv = self.Wv
         if self.flags['norm_type'] in ('unit', 'max_unit'):
             Wv *= self.scalar_norms
-        if self.flags['no_beta_interaction']:
-            temp = v_sample
-        else:
+        if self.flags['lambd_interaction']:
             temp = self.lambd_prec * v_sample
+        else:
+            temp = v_sample
         return T.dot(temp, Wv)
 
     def from_g(self, g_sample):
@@ -474,8 +467,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         return h_mean
     
     def h_given_gv(self, g_sample, v_sample):
-        cg_sample = g_sample - self.goffs if self.flags['enable_centering'] else g_sample
-        h_mean = self.h_given_gv_input(cg_sample, v_sample)
+        h_mean = self.h_given_gv_input(g_sample, v_sample)
         return T.nnet.sigmoid(h_mean)
 
     def sample_h_given_gv(self, g_sample, v_sample, rng=None):
@@ -503,8 +495,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         return g_mean
     
     def g_given_hv(self, h_sample, v_sample):
-        ch_sample = h_sample - self.hoffs if self.flags['enable_centering'] else h_sample
-        g_mean = self.g_given_hv_input(ch_sample, v_sample)
+        g_mean = self.g_given_hv_input(h_sample, v_sample)
         return T.nnet.sigmoid(g_mean)
 
     def sample_g_given_hv(self, h_sample, v_sample, rng=None):
@@ -519,11 +510,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         return g_sample
 
     def s_given_ghv(self, g_sample, h_sample, v_sample):
-        cg_sample = g_sample - self.goffs if self.flags['enable_centering'] else g_sample
-        ch_sample = h_sample - self.hoffs if self.flags['enable_centering'] else h_sample
-
-        from_g = self.from_g(cg_sample)
-        from_h = self.from_h(ch_sample)
+        from_g = self.from_g(g_sample)
+        from_h = self.from_h(h_sample)
         from_v = self.from_v(v_sample)
         s_mean = (1./self.alpha_prec * from_v + self.mu) * from_g * from_h
         return s_mean
@@ -557,16 +545,13 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param h_sample: T.matrix of shape (batch_size, n_h)
         :param s_sample: T.matrix of shape (batch_size, n_s)
         """
-        cg_sample = g_sample - self.goffs if self.flags['enable_centering'] else g_sample
-        ch_sample = h_sample - self.hoffs if self.flags['enable_centering'] else h_sample
-
         Wv = self.Wv
         if self.flags['norm_type'] in ('unit', 'max_unit'):
             Wv *= self.scalar_norms
-        from_g = self.from_g(cg_sample)
-        from_h = self.from_h(ch_sample)
+        from_g = self.from_g(g_sample)
+        from_h = self.from_h(h_sample)
         v_mean = T.dot(s_sample * from_g * from_h, Wv.T)
-        if self.flags['no_beta_interaction']:
+        if not self.flags['lambd_interaction']:
             v_mean *= 1./self.lambd_prec
         return v_mean
 
@@ -604,7 +589,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param n_steps: number of Gibbs updates to perform afterwards.
         """
 
-        """
         def pos_gibbs_iteration(g1, h1, v):
             g2 = self.sample_g_given_hv(h1, v)
             h2 = self.sample_h_given_gv(g2, v)
@@ -619,13 +603,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         new_g = new_g[-1]
         new_h = new_h[-1]
-        """
-
-        new_g = init_state['g']
-        new_h = init_state['h']
-        for i in xrange(n_steps):
-            new_g = self.sample_g_given_hv(new_h, v)
-            new_h = self.sample_h_given_gv(new_g, v)
 
         # update the slab variables given new values of (g,h)
         new_s = self.s_given_ghv(new_g, new_h, v)
@@ -657,9 +634,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         # update running average of positive phase activations
         pos_updates = OrderedDict()
-        if self.flags['enable_centering']:
-            pos_updates[self.goffs] = 0.9 * self.goffs + 0.1 * new_g.mean(axis=0)
-            pos_updates[self.hoffs] = 0.9 * self.hoffs + 0.1 * new_h.mean(axis=0)
 
         return pos_states, pos_updates
 
@@ -673,6 +647,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param v_sample: T.matrix of shape (batch_size, n_v)
         :param n_steps: number of Gibbs updates to perform in negative phase.
         """
+
         def gibbs_iteration(g1, h1, s1, v1):
             g2 = self.sample_g_given_hv(h1, v1)
             h2 = self.sample_h_given_gv(g2, v1)
