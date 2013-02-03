@@ -64,12 +64,11 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def validate_flags(self, flags):
         flags.setdefault('enable_centering', False)
-        flags.setdefault('scalar_lambd', False)
         flags.setdefault('truncate_s', False)
         flags.setdefault('truncate_v', False)
         flags.setdefault('norm_type', None)
         flags.setdefault('no_beta_interaction', False)
-        if len(flags.keys()) != 6:
+        if len(flags.keys()) != 5:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
@@ -238,6 +237,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         ###### All fields you don't want to get pickled (e.g., theano functions) should be created below this line
         # SAMPLING: NEGATIVE PHASE
         neg_updates = self.neg_sampling_updates(n_steps=self.neg_sample_steps, use_pcd=True)
+        self.sample_func = theano.function([], [], updates=neg_updates)
 
         # VARIATIONAL E-STEP
         pos_updates = OrderedDict()
@@ -305,10 +305,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         # enforce constraints function
         constraint_updates = OrderedDict() 
-
-        if self.flags['scalar_lambd']:
-            constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
-
+        constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
         norm_wg = T.sqrt(T.sum(self.Wg**2, axis=0))
         norm_wh = T.sqrt(T.sum(self.Wh**2, axis=0))
         norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
@@ -331,13 +328,13 @@ class BilinearSpikeSlabRBM(Model, Block):
         ## clip parameters to maximum values (if applicable)
         for (k,v) in self.clip_max.iteritems():
             assert k in [param.name for param in self.params()]
-            param = constraint_updates.get(k, getattr(self, k))
+            param = getattr(self, k)
             constraint_updates[param] = T.clip(param, param, v)
 
         ## clip parameters to minimum values (if applicable)
         for (k,v) in self.clip_min.iteritems():
             assert k in [param.name for param in self.params()]
-            param = constraint_updates.get(k, getattr(self, k))
+            param = getattr(self, k)
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
         
         self.enforce_constraints = theano.function([],[], updates=constraint_updates)
@@ -488,7 +485,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         h_mean = self.h_given_gv(g_sample, v_sample)
 
         rng = self.theano_rng if rng is None else rng
-        h_sample = rng.binomial(size=(h_mean.shape[0], self.n_h),
+        h_sample = rng.binomial(size=(self.batch_size, self.n_h),
                                 n=1, p=h_mean, dtype=floatX)
         return h_sample
 
@@ -517,7 +514,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         g_mean = self.g_given_hv(h_sample, v_sample)
 
         rng = self.theano_rng if rng is None else rng
-        g_sample = rng.binomial(size=(g_mean.shape[0], self.n_g),
+        g_sample = rng.binomial(size=(self.batch_size, self.n_g),
                                 n=1, p=g_mean, dtype=floatX)
         return g_sample
 
@@ -538,7 +535,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         if self.flags['truncate_s']:
             s_sample = truncated.truncated_normal(
-                    size=(s_mean.shape[0], self.n_s),
+                    size=(self.batch_size, self.n_s),
                     avg = s_mean, 
                     std = T.sqrt(1./self.alpha_prec),
                     lbound = self.mu - self.truncation_bound['s'],
@@ -547,7 +544,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                     dtype=floatX)
         else: 
             s_sample = rng.normal(
-                    size=(s_mean.shape[0], self.n_s),
+                    size=(self.batch_size, self.n_s),
                     avg = s_mean, 
                     std = T.sqrt(1./self.alpha_prec),
                     dtype=floatX)
@@ -580,7 +577,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         
         if self.flags['truncate_v']:
             v_sample = truncated.truncated_normal(
-                    size=(v_mean.shape[0], self.n_v),
+                    size=(self.batch_size, self.n_v),
                     avg = v_mean, 
                     std = T.sqrt(1./self.lambd_prec),
                     lbound = -self.truncation_bound['v'],
@@ -589,7 +586,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                     dtype=floatX)
         else:
             v_sample = rng.normal(
-                    size=(v_mean.shape[0], self.n_v),
+                    size=(self.batch_size, self.n_v),
                     avg = v_mean, 
                     std = T.sqrt(1./self.lambd_prec),
                     dtype=floatX)
