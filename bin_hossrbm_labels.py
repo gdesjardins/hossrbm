@@ -62,12 +62,14 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def validate_flags(self, flags):
         flags.setdefault('norm_type', None)
+        flags.setdefault('labels', False)
+        flags.setdefault('reweight_labels', False)
         if len(flags.keys()) != 3:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
             numpy_rng = None, theano_rng = None,
-            n_g=99, n_h=99, n_s=None, bw_g=3, bw_h=3, n_v=100, init_from=None,
+            n_l=10, n_g=99, n_h=99, n_s=None, bw_g=3, bw_h=3, n_v=100, init_from=None,
             sparse_gmask = None, sparse_hmask = None,
             pos_mf_steps=1, pos_sample_steps=0, neg_sample_steps=1,
             lr=None, lr_timestamp=None, lr_mults = {},
@@ -125,6 +127,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         # allocate symbolic variable for input
         self.input = T.matrix('input')
+        self.input_labels = T.matrix('input')
         self.init_parameters()
         self.init_chains()
 
@@ -170,8 +173,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.scalar_norms = sharedX(sn_val, name='scalar_norms')
 
         # init weight matrices
-        normalize_wv = self.flags['norm_type'] == 'unit' 
-        self.Wv = self.init_weight(self.iscales['Wv'], (self.n_v, self.n_s), 'Wv', normalize=normalize_wv)
+        unit_norm_filters = self.flags['norm_type'] == 'unit' 
+        self.Wv  = self.init_weight(self.iscales['Wv'], (self.n_v, self.n_s), 'Wv', normalize=unit_norm_filters)
+        self.Whl = self.init_weight(self.iscales['Whl'], (self.n_h, self.n_l), 'Whl', normalize=unit_norm_filters)
         if self.sparse_gmask or self.sparse_hmask:
             assert self.sparse_gmask and self.sparse_hmask
             self.Wg = sharedX(self.sparse_gmask.mask * self.iscales.get('Wg', 1.0), name='Wg')
@@ -191,6 +195,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
         self.vbias = sharedX(self.iscales['vbias'] * numpy.ones(self.n_v), name='vbias')
+        self.lbias = sharedX(self.iscales['lbias'] * numpy.ones(self.n_l), name='lbias')
 
         # mean (mu) and precision (alpha) parameters on s
         self.mu = sharedX(self.iscales['mu'] * numpy.ones(self.n_s), name='mu')
@@ -204,6 +209,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.neg_s  = sharedX(self.rng.rand(self.batch_size, self.n_s), name='neg_s')
         self.neg_h  = sharedX(self.rng.rand(self.batch_size, self.n_h), name='neg_h')
         self.neg_g  = sharedX(self.rng.rand(self.batch_size, self.n_g), name='neg_g')
+        self.neg_l  = sharedX(self.rng.rand(self.batch_size, self.n_l), name='neg_l')
  
     def params(self):
         """
@@ -224,65 +230,66 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_updates = self.neg_sampling_updates(n_steps=self.neg_sample_steps, use_pcd=True)
         self.sample_func = theano.function([], [], updates=neg_updates)
 
-        # VARIATIONAL E-STEP
-        pos_updates = OrderedDict()
-        if self.pos_mf_steps:
-            pos_states, mf_updates = self.e_step_updates(self.input, n_steps=self.pos_mf_steps)
-            pos_updates.update(mf_updates)
+        # SAMPLING: POSITIVE PHASE
+        pos_states_nolabels, pos_updates_nolabels = self.pos_sampling_updates(
+                self.input,
+                init_state = None,
+                n_steps = self.pos_sample_steps)
 
         # SAMPLING: POSITIVE PHASE
-        if self.pos_sample_steps:
-            init_state = pos_states if self.pos_mf_steps else None
-            pos_states, sample_updates = self.pos_sampling_updates(self.input,
-                    init_state = init_state,
-                    n_steps = self.pos_sample_steps)
-            pos_updates.update(sample_updates)
-            cost_fn = self.ml_cost
-        else:
-            cost_fn = self.m_step
+        pos_states_labels, pos_updates_labels = self.pos_sampling_with_labels_updates(
+                self.input, self.input_labels,
+                init_state = None,
+                n_steps = self.pos_sample_steps)
 
-        ##
-        # BUILD COST OBJECTS
-        ##
-        lcost = cost_fn(pos_g = pos_states['g'],
-                        pos_h = pos_states['h'],
-                        pos_s = pos_states['s'],
-                        pos_v = self.input,
-                        neg_g = neg_updates[self.neg_g],
-                        neg_h = neg_updates[self.neg_h],
-                        neg_s = neg_updates[self.neg_s],
-                        neg_v = neg_updates[self.neg_v])
-        spcost = self.get_sparsity_cost(pos_states['g'], pos_states['h'], pos_states['s'])
-        regcost = self.get_reg_cost(self.l2, self.l1)
+        self.batch_train_func = {}
 
-        ##
-        # COMPUTE GRADIENTS WRT. COSTS
-        ##
-        main_cost = [lcost, spcost, regcost]
-        learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
+        for name, pos_states, pos_updates in zip(['nolabel','label'], [pos_states_nolabels, pos_states_labels], [pos_updates_nolabels, pos_updates_labels]):
 
-        weight_updates = OrderedDict()
-        if self.flags['norm_type'] == 'unit':
-            weight_updates[self.Wv] = true_gradient(self.Wv, -learning_grads[self.Wv])
-        if self.flags['norm_type'] in ('unit','unit_gh'):
-            if self.Wg in self.params():
-                weight_updates[self.Wg] = true_gradient(self.Wg, -learning_grads[self.Wg])
-            if self.Wh in self.params():
-                weight_updates[self.Wh] = true_gradient(self.Wh, -learning_grads[self.Wh])
+            ##
+            # BUILD COST OBJECTS
+            ##
+            lcost = self.ml_cost(
+                            pos_g = pos_states['g'],
+                            pos_h = pos_states['h'],
+                            pos_s = pos_states['s'],
+                            pos_v = self.input,
+                            neg_g = neg_updates[self.neg_g],
+                            neg_h = neg_updates[self.neg_h],
+                            neg_s = neg_updates[self.neg_s],
+                            neg_v = neg_updates[self.neg_v])
+            spcost = self.get_sparsity_cost(pos_states['g'], pos_states['h'], pos_states['s'])
+            regcost = self.get_reg_cost(self.l2, self.l1)
 
-        ##
-        # BUILD UPDATES DICTIONARY FROM GRADIENTS
-        ##
-        learning_updates = costmod.get_updates(learning_grads)
-        learning_updates.update(pos_updates)
-        learning_updates.update(neg_updates)
-        learning_updates.update({self.iter: self.iter+1})
-        learning_updates.update(weight_updates)
+            ##
+            # COMPUTE GRADIENTS WRT. COSTS
+            ##
+            main_cost = [lcost, spcost, regcost]
+            learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
 
-        # build theano function to train on a single minibatch
-        self.batch_train_func = function([self.input], [],
-                                         updates=learning_updates,
-                                         name='train_rbm_func')
+            weight_updates = OrderedDict()
+            if self.flags['norm_type'] == 'unit':
+                weight_updates[self.Wv] = true_gradient(self.Wv, -learning_grads[self.Wv])
+            if self.flags['norm_type'] in ('unit','unit_gh'):
+                if self.Wg in self.params():
+                    weight_updates[self.Wg] = true_gradient(self.Wg, -learning_grads[self.Wg])
+                if self.Wh in self.params():
+                    weight_updates[self.Wh] = true_gradient(self.Wh, -learning_grads[self.Wh])
+
+            ##
+            # BUILD UPDATES DICTIONARY FROM GRADIENTS
+            ##
+            learning_updates = costmod.get_updates(learning_grads)
+            learning_updates.update(pos_updates)
+            learning_updates.update(neg_updates)
+            learning_updates.update({self.iter: self.iter+1})
+            learning_updates.update(weight_updates)
+
+            # build theano function to train on a single minibatch
+            inputs = [self.input, self.input_labels] if name == 'label' else [self.input]
+            self.batch_train_func[name] = function(inputs, [],
+                                             updates=learning_updates,
+                                             name='train_rbm_func')
 
         #######################
         # CONSTRAINT FUNCTION #
@@ -332,8 +339,12 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def train_batch(self, dataset, batch_size):
 
-        x = dataset.get_batch_design(batch_size, include_labels=False)
-        self.batch_train_func(x)
+        rval = dataset.get_batch_design(batch_size, include_labels=False)
+        if isinstance(rval, tuple):
+            self.batch_train_func['label'](rval[0], rval[1])
+        else:
+            self.batch_train_func['nolabel'](rval[0])
+
         self.enforce_constraints()
 
         # accounting...
@@ -351,7 +362,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return self.batches_seen < self.max_updates
 
-    def energy(self, g_sample, h_sample, s_sample, v_sample, s_squared=None):
+    def energy(self, g_sample, h_sample, s_sample, v_sample, l_sample, s_squared=None):
         """
         Computes energy for a given configuration of (g,h,v,x,y).
         :param h_sample: T.matrix of shape (batch_size, n_g)
@@ -372,6 +383,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         energy -= T.dot(g_sample, self.gbias)
         energy -= T.dot(h_sample, self.hbias)
         energy -= T.dot(v_sample, self.vbias)
+        label_energy  = T.sum(l_sample, T.dot(h_sample, self.Whl), axis=1)
+        label_energy += T.dot(l_sample, self.lbias)
+        energy -= (self.n_v / self.n_l) * label_energy
         return energy
 
     def __call__(self, v, output_type='g+h'):
@@ -434,7 +448,26 @@ class BilinearSpikeSlabRBM(Model, Block):
     def to_h(self, h_s):
         return T.dot(h_s, self.Wh.T) + self.hbias
 
-    def h_given_gv_input(self, g_sample, v_sample):
+    def l_given_h(self, h_sample):
+        """
+        Compute p(l_i = 1 | h)
+        :param h_sample: T.matrix of shape (batch_size, n_l matrix)
+        """
+        l_mean = T.dot(h_sample, self.Whl) + self.lbias
+        return T.nnet.sigmoid(l_mean)
+ 
+    def sample_l_given_h(self, h_sample, rng=None):
+        """
+        Generates sample from p(l | h)
+        """
+        l_mean = self.l_given_h(h_sample)
+
+        rng = self.theano_rng if rng is None else rng
+        l_sample = rng.binomial(size=(self.batch_size, self.n_l),
+                                n=1, p=l_mean, dtype=floatX)
+        return l_sample
+   
+    def h_given_gv_input(self, g_sample, v_sample, l_sample):
         """
         Compute mean activation of h given v.
         :param g_sample: T.matrix of shape (batch_size, n_g matrix)
@@ -445,20 +478,22 @@ class BilinearSpikeSlabRBM(Model, Block):
         h_mean_s = 0.5 * 1./self.alpha_prec * from_g * from_v**2
         h_mean_s += from_g * from_v * self.mu
         h_mean = self.to_h(h_mean_s)
+        h_mean += (self.n_v / self.n_l) * T.dot(l_sample, self.Whl.T)
         return h_mean
     
-    def h_given_gv(self, g_sample, v_sample):
-        h_mean = self.h_given_gv_input(g_sample, v_sample)
+    def h_given_gv(self, g_sample, v_sample, l_sample):
+        h_mean = self.h_given_gv_input(g_sample, v_sample, l_sample)
         return T.nnet.sigmoid(h_mean)
 
-    def sample_h_given_gv(self, g_sample, v_sample, rng=None):
+    def sample_h_given_gv(self, g_sample, v_sample, l_sample, rng=None, size=None):
         """
         Generates sample from p(h | g, v)
         """
-        h_mean = self.h_given_gv(g_sample, v_sample)
+        h_mean = self.h_given_gv(g_sample, v_sample, l_sample=l_sample)
 
         rng = self.theano_rng if rng is None else rng
-        h_sample = rng.binomial(size=(self.batch_size, self.n_h),
+        size = size if size else self.batch_size
+        h_sample = rng.binomial(size=(size, self.n_h),
                                 n=1, p=h_mean, dtype=floatX)
         return h_sample
 
@@ -479,14 +514,15 @@ class BilinearSpikeSlabRBM(Model, Block):
         g_mean = self.g_given_hv_input(h_sample, v_sample)
         return T.nnet.sigmoid(g_mean)
 
-    def sample_g_given_hv(self, h_sample, v_sample, rng=None):
+    def sample_g_given_hv(self, h_sample, v_sample, rng=None, size=None):
         """
         Generates sample from p(g | h, v)
         """
         g_mean = self.g_given_hv(h_sample, v_sample)
 
         rng = self.theano_rng if rng is None else rng
-        g_sample = rng.binomial(size=(self.batch_size, self.n_g),
+        size = size if size else self.batch_size
+        g_sample = rng.binomial(size=(size, self.n_g),
                                 n=1, p=g_mean, dtype=floatX)
         return g_sample
 
@@ -535,23 +571,64 @@ class BilinearSpikeSlabRBM(Model, Block):
     # SAMPLING STUFF #
     ##################
     def pos_sampling(self, v, init_state, n_steps=1):
-        """
-        Mixed mean-field + sampling inference in positive phase.
-        :param v: input being conditioned on
-        :param init: dictionary of initial values
-        :param n_steps: number of Gibbs updates to perform afterwards.
-        """
 
-        def pos_gibbs_iteration(g1, h1, v):
+        def pos_gibbs_iteration(g1, h1, l1, v):
+            g2 = self.sample_g_given_hv(h1, v, size=v.shape[0])
+            h2 = self.sample_h_given_gv(g2, v, l1, size=v.shape[0])
+            l2 = self.sample_l_given_h(h2)
+            return [g2, h2, l2]
+
+        [new_g, new_h, new_l], updates = theano.scan(
+                pos_gibbs_iteration,
+                outputs_info = [init_state['g'],
+                                init_state['h'],
+                                init_state['l']],
+                non_sequences = [v],
+                n_steps=n_steps)
+
+        new_g = new_g[-1]
+        new_h = new_h[-1]
+        new_l = new_l[-1]
+
+        # update the slab variables given new values of (g,h)
+        new_s = self.s_given_ghv(new_g, new_h, v)
+
+        return [new_g, new_h, new_s, new_l]
+
+    def pos_sampling_updates(self, v, init_state=None, n_steps=1):
+        if init_state is None:
+            assert n_steps
+            # start sampler from scratch
+            init_state = OrderedDict()
+            init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
+            init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
+            init_state['l'] = T.ones((self.batch_size,self.n_l)) * T.nnet.sigmoid(self.lbias)
+
+        [new_g, new_h, new_s, new_l] = self.pos_sampling(v, init_state=init_state, n_steps=n_steps)
+
+        pos_states = OrderedDict()
+        pos_states['g'] = new_g
+        pos_states['h'] = new_h
+        pos_states['s'] = new_s
+        pos_states['l'] = new_l
+
+        # update running average of positive phase activations
+        pos_updates = OrderedDict()
+
+        return pos_states, pos_updates
+
+    def pos_sampling_with_labels(self, v, l, init_state, n_steps=1):
+
+        def pos_gibbs_iteration(g1, h1, v, l):
             g2 = self.sample_g_given_hv(h1, v)
-            h2 = self.sample_h_given_gv(g2, v)
+            h2 = self.sample_h_given_gv(g2, v, l)
             return [g2, h2]
 
         [new_g, new_h], updates = theano.scan(
                 pos_gibbs_iteration,
                 outputs_info = [init_state['g'],
                                 init_state['h']],
-                non_sequences = [v],
+                non_sequences = [v, l],
                 n_steps=n_steps)
 
         new_g = new_g[-1]
@@ -562,15 +639,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return [new_g, new_h, new_s]
 
-    def pos_sampling_updates(self, v, init_state=None, n_steps=1):
-        """
-        Implements the positive phase sampling, which performs blocks Gibbs
-        sampling in order to sample from p(g,h,x,y|v).
-        :param v: fixed training set
-        :param init: dictionary of initial values, or None if sampling from scratch
-        :param n_steps: scalar, number of Gibbs steps to perform.
-        :param restart: if False, start sampling from buffers self.pos_*
-        """
+    def pos_sampling_with_labels_updates(self, v, l, init_state=None, n_steps=1):
         if init_state is None:
             assert n_steps
             # start sampler from scratch
@@ -578,7 +647,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
             init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
 
-        [new_g, new_h, new_s] = self.pos_sampling(v, init_state=init_state, n_steps=n_steps)
+        [new_g, new_h, new_s] = self.pos_sampling(v, l, init_state=init_state, n_steps=n_steps)
 
         pos_states = OrderedDict()
         pos_states['g'] = new_g
@@ -587,10 +656,9 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         # update running average of positive phase activations
         pos_updates = OrderedDict()
-
         return pos_states, pos_updates
 
-    def neg_sampling(self, g_sample, h_sample, s_sample, v_sample, n_steps=1):
+    def neg_sampling(self, g_sample, h_sample, s_sample, v_sample, l_sample, n_steps=1):
         """
         Gibbs step for negative phase, which alternates:
         p(g|b,h,v), p(h|b,g,v), p(b|g,h,v), p(s|b,g,h,v) and p(v|b,g,h,s)
@@ -598,22 +666,24 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param h_sample: T.matrix of shape (batch_size, n_h)
         :param s_sample: T.matrix of shape (batch_size, n_s)
         :param v_sample: T.matrix of shape (batch_size, n_v)
+        :param l_sample: T.matrix of shape (batch_size, n_l)
         :param n_steps: number of Gibbs updates to perform in negative phase.
         """
 
-        def gibbs_iteration(g1, h1, s1, v1):
-            g2 = self.sample_g_given_hv(h1, v1)
-            h2 = self.sample_h_given_gv(g2, v1)
+        def gibbs_iteration(g1, h1, s1, v1, l1):
+            l2 = self.sample_l_given_h(h1)
+            h2 = self.sample_h_given_gv(g1, v1, l2)
+            g2 = self.sample_g_given_hv(h2, v1)
             s2 = self.sample_s_given_ghv(g2, h2, v1)
             v2 = self.sample_v_given_ghs(g2, h2, s2)
-            return [g2, h2, s2, v2]
+            return [g2, h2, s2, v2, l2]
 
-        [new_g, new_h, new_s, new_v] , updates = theano.scan(
+        [new_g, new_h, new_s, new_v, new_l] , updates = theano.scan(
                 gibbs_iteration,
-                outputs_info = [g_sample, h_sample, s_sample, v_sample],
+                outputs_info = [g_sample, h_sample, s_sample, v_sample, l_sample],
                 n_steps=n_steps)
 
-        return [new_g[-1], new_h[-1], new_s[-1], new_v[-1]]
+        return [new_g[-1], new_h[-1], new_s[-1], new_v[-1], new_l[-1]]
 
     def neg_sampling_updates(self, n_steps=1, use_pcd=True):
         """
@@ -655,72 +725,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return costmod.Cost(cost, self.params(), cte)
 
-
-    ####################
-    # MEAN-FIELD STUFF #
-    ####################
-
-    def ml_g_hat(self, h_hat, v):
-        return self.g_given_hv(h_hat, v)
-
-    def ml_h_hat(self, g_hat, v):
-        return self.h_given_gv(g_hat, v)
-
-    def e_step(self, v, n_steps=100, eps=1e-2):
-        new_g = T.ones((v.shape[0], self.n_g)) * T.nnet.sigmoid(self.gbias)
-        new_h = T.ones((v.shape[0], self.n_h)) * T.nnet.sigmoid(self.hbias)
-
-        def estep_iteration(g1, h1, v):
-            g2 = self.ml_g_hat(h1, v)
-            h2 = self.ml_h_hat(g2, v)
-            return [g2, h2], theano.scan_module.until(
-                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
-
-        [new_g, new_h], updates = theano.scan(
-                    estep_iteration,
-                    outputs_info = [new_g, new_h],
-                    non_sequences = [v],
-                    n_steps=n_steps)
-        new_g = new_g[-1]
-        new_h = new_h[-1]
-
-        # update the slab variables given new values of (g,h)
-        new_s = self.s_given_ghv(new_g, new_h, v)
-
-        return [new_g, new_h, new_s]
-
-    def e_step_updates(self, v, n_steps=1):
-        [new_g, new_h, new_s] = self.e_step(v, n_steps=n_steps)
-
-        pos_states = OrderedDict()
-        pos_states['g'] = new_g
-        pos_states['h'] = new_h
-        pos_states['s'] = new_s
-
-        pos_updates = OrderedDict()
-
-        return pos_states, pos_updates
-
-    def m_step(self, pos_g, pos_h, pos_s, pos_v, neg_g, neg_h, neg_s, neg_v):
-        """
-        Variational approximation to the maximum likelihood positive phase.
-        :param v: T.matrix of shape (batch_size, n_v), training examples
-        :return: tuple (cost, gradient)
-        """
-        # compute E_q(s|f,g,h,v)[s**2]
-        s_squared = pos_s**2 + 1./self.alpha_prec
-        minus_cost = -T.sum(self.energy(pos_g, pos_h, pos_s, pos_v, s_squared = s_squared))
-        minus_cost += T.sum(self.energy(neg_g, neg_h, neg_s, neg_v))
-
-        # We flip the sign because by convention, the gradients returned
-        # by this func. are used to minimize a quantity.
-        cost = - minus_cost / self.batch_size
-
-        # build gradient of cost with respect to model parameters
-        cte = [pos_g, pos_h, pos_s, pos_v, s_squared, neg_g, neg_h, neg_s, neg_v]
-
-        return costmod.Cost(cost, self.params(), cte)
-    
     ##############################
     # GENERIC OPTIMIZATION STUFF #
     ##############################

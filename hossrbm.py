@@ -469,14 +469,15 @@ class BilinearSpikeSlabRBM(Model, Block):
         h_mean = self.h_given_gv_input(g_sample, v_sample)
         return T.nnet.sigmoid(h_mean)
 
-    def sample_h_given_gv(self, g_sample, v_sample, rng=None):
+    def sample_h_given_gv(self, g_sample, v_sample, rng=None, size=None):
         """
         Generates sample from p(h | g, v)
         """
         h_mean = self.h_given_gv(g_sample, v_sample)
 
         rng = self.theano_rng if rng is None else rng
-        h_sample = rng.binomial(size=(self.batch_size, self.n_h),
+        size = size if size else self.batch_size
+        h_sample = rng.binomial(size=(size, self.n_h),
                                 n=1, p=h_mean, dtype=floatX)
         return h_sample
 
@@ -497,14 +498,15 @@ class BilinearSpikeSlabRBM(Model, Block):
         g_mean = self.g_given_hv_input(h_sample, v_sample)
         return T.nnet.sigmoid(g_mean)
 
-    def sample_g_given_hv(self, h_sample, v_sample, rng=None):
+    def sample_g_given_hv(self, h_sample, v_sample, rng=None, size=None):
         """
         Generates sample from p(g | h, v)
         """
         g_mean = self.g_given_hv(h_sample, v_sample)
 
         rng = self.theano_rng if rng is None else rng
-        g_sample = rng.binomial(size=(self.batch_size, self.n_g),
+        size = size if size else self.batch_size
+        g_sample = rng.binomial(size=(size, self.n_g),
                                 n=1, p=g_mean, dtype=floatX)
         return g_sample
 
@@ -589,8 +591,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         """
 
         def pos_gibbs_iteration(g1, h1, v):
-            g2 = self.sample_g_given_hv(h1, v)
-            h2 = self.sample_h_given_gv(g2, v)
+            g2 = self.sample_g_given_hv(h1, v, size=v.shape[0])
+            h2 = self.sample_h_given_gv(g2, v, size=v.shape[0])
             return [g2, h2]
 
         [new_g, new_h], updates = theano.scan(
