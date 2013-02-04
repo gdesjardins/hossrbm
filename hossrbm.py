@@ -26,7 +26,6 @@ from pylearn2.space import VectorSpace
 import truncated
 import cost as costmod
 from utils import tools
-from utils import rbm_utils
 from utils import sharedX, floatX, npy_floatX
 from true_gradient import true_gradient
 
@@ -847,8 +846,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_matrix(self.Wh))
         chans.update(self.monitor_vector(self.gbias))
         chans.update(self.monitor_vector(self.hbias))
-        chans.update(self.monitor_vector(self.goffs))
-        chans.update(self.monitor_vector(self.hoffs))
         chans.update(self.monitor_vector(self.alpha_prec, name='alpha_prec'))
         chans.update(self.monitor_vector(self.mu))
         chans.update(self.monitor_vector(self.lambd_prec, name='lambd_prec'))
