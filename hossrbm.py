@@ -395,7 +395,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h, s] = self.pos_sampling(v, init_state, n_steps=self.pos_sample_steps)
+        [g, h, s] = self.pos_sampling(v, init_state, n_steps=self.pos_sample_steps, mean_field=True)
 
         atoms = {
                 'g_s' : T.dot(g, self.Wg),  # g in s-space
@@ -582,7 +582,7 @@ class BilinearSpikeSlabRBM(Model, Block):
     ##################
     # SAMPLING STUFF #
     ##################
-    def pos_sampling(self, v, init_state, n_steps=1):
+    def pos_sampling(self, v, init_state, n_steps=1, mean_field=False):
         """
         Mixed mean-field + sampling inference in positive phase.
         :param v: input being conditioned on
@@ -591,8 +591,12 @@ class BilinearSpikeSlabRBM(Model, Block):
         """
 
         def pos_gibbs_iteration(g1, h1, v):
-            g2 = self.sample_g_given_hv(h1, v, size=v.shape[0])
-            h2 = self.sample_h_given_gv(g2, v, size=v.shape[0])
+            if mean_field:
+                g2 = self.g_given_hv(h1, v)
+                h2 = self.h_given_gv(g2, v)
+            else:
+                g2 = self.sample_g_given_hv(h1, v, size=v.shape[0])
+                h2 = self.sample_h_given_gv(g2, v, size=v.shape[0])
             return [g2, h2]
 
         [new_g, new_h], updates = theano.scan(
