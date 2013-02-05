@@ -125,8 +125,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.theano_rng = RandomStreams(self.rng.randint(2**30)) if theano_rng is None else theano_rng
 
         ############### ALLOCATE PARAMETERS #################
-        assert n_g / bw_g == n_h / bw_h
-        self.n_s = n_s if n_s else (n_g / bw_g) * (bw_g * bw_h)
 
         # allocate symbolic variable for input
         self.input = T.matrix('input')
