@@ -61,16 +61,46 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.iter.set_value(model.iter.get_value())
 
     def validate_flags(self, flags):
-        flags.setdefault('norm_type', None)
-        if len(flags.keys()) != 1:
+        flags.setdefault('norm_type', 'none')
+        flags.setdefault('split_norm', False)
+        flags.setdefault('mean_field', False)
+        if len(flags.keys()) != 3:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
+    @classmethod
+    def init_from_model(cls, model):
+        return BilinearSpikeSlabRBM(
+                refmodel = model,
+                n_g=model.n_g,
+                n_h=model.n_h,
+                n_s=model.n_s,
+                n_v=model.n_v,
+                sparse_gmask=model.sparse_gmask,
+                sparse_hmask=model.sparse_hmask,
+                pos_steps=model.pos_steps,
+                iscales=model.iscales,
+                clip_min=model.clip_min,
+                clip_max=model.clip_max,
+                lr_spec=model.lr_spec,
+                lr_timestamp=model.lr_timestamp,
+                lr_mults=model.lr_mults,
+                l1=model.l1,
+                l2=model.l2,
+                sp_weight=model.sp_weight,
+                sp_targ=model.sp_targ,
+                batch_size=model.batch_size,
+                my_save_path=model.my_save_path + '_nolabel',
+                save_at=model.save_at,
+                save_every=model.save_every,
+                flags=model.flags,
+                max_updates=model.max_updates)
+
     def __init__(self, 
-            numpy_rng = None, theano_rng = None,
-            n_g=99, n_h=99, n_s=None, bw_g=3, bw_h=3, n_v=100, init_from=None,
+            numpy_rng = None, theano_rng = None, refmodel=None,
+            n_g=99, n_h=99, n_s=99, n_v=100, init_from=None,
             sparse_gmask = None, sparse_hmask = None,
-            pos_mf_steps=1, pos_sample_steps=0, neg_sample_steps=1,
-            lr=None, lr_timestamp=None, lr_mults = {},
+            pos_steps=1, neg_sample_steps=1,
+            lr_spec=None, lr_timestamp=None, lr_mults = {},
             iscales={}, clip_min={}, clip_max={},
             l1 = {}, l2 = {},
             sp_weight={}, sp_targ={},
@@ -94,7 +124,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         """
         Model.__init__(self)
         Block.__init__(self)
-        assert lr is not None
+        assert lr_spec is not None
         for k in ['h']: assert k in sp_weight.keys()
         for k in ['h']: assert k in sp_targ.keys()
         self.validate_flags(flags)
@@ -120,27 +150,27 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.theano_rng = RandomStreams(self.rng.randint(2**30)) if theano_rng is None else theano_rng
 
         ############### ALLOCATE PARAMETERS #################
-        assert n_g / bw_g == n_h / bw_h
-        self.n_s = n_s if n_s else (n_g / bw_g) * (bw_g * bw_h)
-
         # allocate symbolic variable for input
         self.input = T.matrix('input')
-        self.init_parameters()
+        if refmodel: 
+            self.init_parameters_from_model(refmodel)
+        else:
+            self.init_parameters()
         self.init_chains()
 
         # learning rate, with deferred 1./t annealing
         self.iter = sharedX(0.0, name='iter')
 
-        if lr['type'] == 'anneal':
-            num = lr['init'] * lr['start'] 
-            pos = T.maximum(lr['start'], lr['slope'] * self.iter)
-            self.lr = T.maximum(lr['floor'], num/denum) 
-        elif lr['type'] == 'linear':
-            lr_start = npy_floatX(lr['start'])
-            lr_end   = npy_floatX(lr['end'])
+        if lr_spec['type'] == 'anneal':
+            num = lr_spec['init'] * lr_spec['start'] 
+            pos = T.maximum(lr_spec['start'], lr_spec['slope'] * self.iter)
+            self.lr = T.maximum(lr_spec['floor'], num/denum) 
+        elif lr_spec['type'] == 'linear':
+            lr_start = npy_floatX(lr_spec['start'])
+            lr_end   = npy_floatX(lr_spec['end'])
             self.lr = lr_start + self.iter * (lr_end - lr_start) / npy_floatX(self.max_updates)
         else:
-            raise ValueError('Incorrect value for lr[type]')
+            raise ValueError('Incorrect value for lr_spec[type]')
 
         # configure input-space (new pylearn2 feature?)
         self.input_space = VectorSpace(n_v)
@@ -163,6 +193,20 @@ class BilinearSpikeSlabRBM(Model, Block):
         if normalize:
             value /= numpy.sqrt(numpy.sum(value**2, axis=axis))
         return sharedX(value, name=name)
+
+    def init_parameters_from_model(self, model):
+        self.scalar_norms = model.scalar_norms
+        self.Wv = model.Wv
+        self.Wg = model.Wg
+        self.Wh = model.Wh
+        self.avg_norm_wg = model.avg_norm_wg
+        self.avg_norm_wh = model.avg_norm_wh
+        self.gbias = model.gbias
+        self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
+        self.vbias = model.vbias
+        self.mu = model.mu
+        self.alpha = model.alpha
+        self.alpha_prec = model.alpha_prec
 
     def init_parameters(self):
         # init scalar norm for each entry of Wv
@@ -210,7 +254,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         Returns a list of learnt model parameters.
         """
         params = [self.Wv, self.hbias, self.gbias, self.vbias, self.alpha, self.mu]
-        if self.flags['norm_type'] in ('unit','max_unit'):
+        if self.flags['split_norm']:
             params += [self.scalar_norms]
         return params
 
@@ -224,34 +268,25 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_updates = self.neg_sampling_updates(n_steps=self.neg_sample_steps, use_pcd=True)
         self.sample_func = theano.function([], [], updates=neg_updates)
 
-        # VARIATIONAL E-STEP
-        pos_updates = OrderedDict()
-        if self.pos_mf_steps:
-            pos_states, mf_updates = self.e_step_updates(self.input, n_steps=self.pos_mf_steps)
-            pos_updates.update(mf_updates)
-
-        # SAMPLING: POSITIVE PHASE
-        if self.pos_sample_steps:
-            init_state = pos_states if self.pos_mf_steps else None
-            pos_states, sample_updates = self.pos_sampling_updates(self.input,
-                    init_state = init_state,
-                    n_steps = self.pos_sample_steps)
-            pos_updates.update(sample_updates)
-            cost_fn = self.ml_cost
-        else:
-            cost_fn = self.m_step
+        # POSITIVE PHASE
+        pos_states, pos_updates = self.pos_phase_updates(
+                self.input,
+                n_steps = self.pos_steps,
+                mean_field=self.flags['mean_field'])
 
         ##
         # BUILD COST OBJECTS
         ##
-        lcost = cost_fn(pos_g = pos_states['g'],
+        lcost = self.ml_cost(
+                        pos_g = pos_states['g'],
                         pos_h = pos_states['h'],
                         pos_s = pos_states['s'],
                         pos_v = self.input,
                         neg_g = neg_updates[self.neg_g],
                         neg_h = neg_updates[self.neg_h],
                         neg_s = neg_updates[self.neg_s],
-                        neg_v = neg_updates[self.neg_v])
+                        neg_v = neg_updates[self.neg_v],
+                        mean_field=self.flags['mean_field'])
         spcost = self.get_sparsity_cost(pos_states['g'], pos_states['h'], pos_states['s'])
         regcost = self.get_reg_cost(self.l2, self.l1)
 
@@ -287,7 +322,17 @@ class BilinearSpikeSlabRBM(Model, Block):
         #######################
         # CONSTRAINT FUNCTION #
         #######################
+        constraint_updates = self.get_constraint_updates()
+        self.enforce_constraints = theano.function([],[], updates=constraint_updates)
 
+        ###### All fields you don't want to get pickled should be created above this line
+        final_names = dir(self)
+        self.register_names_to_del( [ name for name in (final_names) if name not in init_names ])
+
+        # Before we start learning, make sure constraints are enforced
+        self.enforce_constraints()
+
+    def get_constraint_updates(self):
         # enforce constraints function
         constraint_updates = OrderedDict() 
         norm_wg = T.sqrt(T.sum(self.Wg**2, axis=0))
@@ -320,16 +365,9 @@ class BilinearSpikeSlabRBM(Model, Block):
             assert k in [param.name for param in self.params()]
             param = constraint_updates.get(k, getattr(self, k))
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
-        
-        self.enforce_constraints = theano.function([],[], updates=constraint_updates)
 
-        ###### All fields you don't want to get pickled should be created above this line
-        final_names = dir(self)
-        self.register_names_to_del( [ name for name in (final_names) if name not in init_names ])
-
-        # Before we start learning, make sure constraints are enforced
-        self.enforce_constraints()
-
+        return constraint_updates
+ 
     def train_batch(self, dataset, batch_size):
 
         x = dataset.get_batch_design(batch_size, include_labels=False)
@@ -376,12 +414,10 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def __call__(self, v, output_type='g+h'):
         print 'Building representation with %s' % output_type
-        #[g, h, s] = self.e_step(v, n_steps=self.pos_mf_steps)
-
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h, s] = self.pos_sampling(v, init_state, n_steps=self.pos_sample_steps, mean_field=True)
+        [g, h, s] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=True)
 
         atoms = {
                 'g_s' : T.dot(g, self.Wg),  # g in s-space
@@ -536,7 +572,7 @@ class BilinearSpikeSlabRBM(Model, Block):
     ##################
     # SAMPLING STUFF #
     ##################
-    def pos_sampling(self, v, init_state, n_steps=1, mean_field):
+    def pos_phase(self, v, init_state, n_steps=1, mean_field=False):
         """
         Mixed mean-field + sampling inference in positive phase.
         :param v: input being conditioned on
@@ -544,7 +580,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param n_steps: number of Gibbs updates to perform afterwards.
         """
 
-        def pos_gibbs_iteration(g1, h1, v):
+        def pos_gibbs_iteration(g1, h1, v, size):
             if mean_field:
                 g2 = self.g_given_hv(h1, v)
                 h2 = self.h_given_gv(g2, v)
@@ -557,7 +593,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                 pos_gibbs_iteration,
                 outputs_info = [init_state['g'],
                                 init_state['h']],
-                non_sequences = [v],
+                non_sequences = [v, v.shape[0]],
                 n_steps=n_steps)
 
         new_g = new_g[-1]
@@ -568,7 +604,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return [new_g, new_h, new_s]
 
-    def pos_sampling_updates(self, v, init_state=None, n_steps=1):
+    def pos_phase_updates(self, v, init_state=None, n_steps=1, mean_field=False):
         """
         Implements the positive phase sampling, which performs blocks Gibbs
         sampling in order to sample from p(g,h,x,y|v).
@@ -584,7 +620,8 @@ class BilinearSpikeSlabRBM(Model, Block):
             init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
             init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
 
-        [new_g, new_h, new_s] = self.pos_sampling(v, init_state=init_state, n_steps=n_steps)
+        [new_g, new_h, new_s] = self.pos_phase(v, init_state=init_state,
+                n_steps=n_steps, mean_field=mean_field)
 
         pos_states = OrderedDict()
         pos_states['g'] = new_g
@@ -644,13 +681,18 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return updates
 
-    def ml_cost(self, pos_g, pos_h, pos_s, pos_v, neg_g, neg_h, neg_s, neg_v):
+    def ml_cost(self, pos_g, pos_h, pos_s, pos_v,
+                      neg_g, neg_h, neg_s, neg_v, mean_field=False):
         """
         Variational approximation to the maximum likelihood positive phase.
         :param v: T.matrix of shape (batch_size, n_v), training examples
         :return: tuple (cost, gradient)
         """
-        pos_cost = T.sum(self.energy(pos_g, pos_h, pos_s, pos_v))
+        if mean_field:
+            s_squared = pos_s**2 + 1./self.alpha_prec
+            pos_cost = T.sum(self.energy(pos_g, pos_h, pos_s, pos_v, s_squared = s_squared))
+        else:
+            pos_cost = T.sum(self.energy(pos_g, pos_h, pos_s, pos_v))
         neg_cost = T.sum(self.energy(neg_g, neg_h, neg_s, neg_v))
         batch_cost = pos_cost - neg_cost
         cost = batch_cost / self.batch_size
@@ -658,6 +700,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         # build gradient of cost with respect to model parameters
         cte = [pos_g, pos_h, pos_s, pos_v,
                neg_g, neg_h, neg_s, neg_v]
+        if mean_field: cte += [s_squared]
 
         return costmod.Cost(cost, self.params(), cte)
 
@@ -806,6 +849,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_matrix(self.Wh))
         chans.update(self.monitor_vector(self.gbias))
         chans.update(self.monitor_vector(self.hbias))
+        chans.update(self.monitor_vector(self.vbias))
         chans.update(self.monitor_vector(self.alpha_prec, name='alpha_prec'))
         chans.update(self.monitor_vector(self.mu))
         chans.update(self.monitor_matrix(self.neg_g))
@@ -825,4 +869,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
 
     def setup(self, model, dataset):
+        #x = dataset.get_batch_design(10000, include_labels=False)
+        #ml_vbias = rbm_utils.compute_ml_bias(x)
+        #model.vbias.set_value(ml_vbias)
         super(TrainingAlgorithm, self).setup(model, dataset)
