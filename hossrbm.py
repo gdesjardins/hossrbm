@@ -206,14 +206,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
         self.lambd_prec = T.nnet.softplus(self.lambd)
 
-    """
-    def init_chains(self):
-        self.neg_v  = sharedX(self.rng.rand(self.batch_size, self.n_v), name='neg_v')
-        self.neg_s  = sharedX(self.rng.rand(self.batch_size, self.n_s), name='neg_s')
-        self.neg_h  = sharedX(self.rng.rand(self.batch_size, self.n_h), name='neg_h')
-        self.neg_g  = sharedX(self.rng.rand(self.batch_size, self.n_g), name='neg_g')
-    """
-
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
         def softplus(x): return numpy.log(1. + numpy.exp(x))
@@ -352,9 +344,9 @@ class BilinearSpikeSlabRBM(Model, Block):
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
 
         return constraint_updates
- 
+
     def train_batch(self, dataset, batch_size):
-    
+
         x = dataset.get_batch_design(batch_size, include_labels=False)
         if self.flags['truncate_v']:
             x = numpy.clip(x, -self.truncation_bound['v'], self.truncation_bound['v'])
@@ -438,34 +430,22 @@ class BilinearSpikeSlabRBM(Model, Block):
         energy -= T.dot(h_hat, self.hbias)
         return T.mean(energy), [g_hat, h_hat, v, E_s_given_g1_h1, E_s2_given_g1_h1, E_s2_given_g0_h0]
 
-    def __call__(self, v, output_type='g+h'):
+    def __call__(self, v, output_type='g+h', mean_field=True):
         print 'Building representation with %s' % output_type
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h, s] = self.pos_phase(v, init_state, n_steps=100, mean_field=True)
+        [g, h] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
 
         atoms = {
                 'g_s' : T.dot(g, self.Wg),  # g in s-space
                 'h_s' : T.dot(h, self.Wh),  # h in s-space
-                's_g' : T.sqrt(T.dot(s**2, self.Wg.T)),
-                's_h' : T.sqrt(T.dot(s**2, self.Wh.T)),
-                's_g__h' : T.sqrt(T.dot(s**2 * T.dot(h, self.Wh), self.Wg.T)),
-                's_h__g' : T.sqrt(T.dot(s**2 * T.dot(g, self.Wg), self.Wh.T))
                 }
 
         output_prods = {
-                ## factored representations
                 'g' : g,
                 'h' : h,
                 'gh' : (g.dimshuffle(0,1,'x') * h.dimshuffle(0,'x',1)).flatten(ndim=2),
-                'gs': g * atoms['s_g'],
-                'hs': h * atoms['s_h'],
-                's_g': atoms['s_g'],
-                's_h': atoms['s_h'],
-                ## unfactored representations
-                'sg_s' : atoms['g_s'] * s,
-                'sh_s' : atoms['h_s'] * s,
                 }
 
         toks = output_type.split('+')
@@ -606,14 +586,14 @@ class BilinearSpikeSlabRBM(Model, Block):
             v_mean *= 1./self.lambd_prec
         return v_mean
 
-    def sample_v_given_ghs(self, g_sample, h_sample, s_sample, rng=None):
+    def sample_v_given_ghs(self, g_sample, h_sample, s_sample, rng=None, size=None):
         v_mean = self.v_given_ghs(g_sample, h_sample, s_sample)
 
         rng = self.theano_rng if rng is None else rng
-        
+        size = size if size else self.batch_size
         if self.flags['truncate_v']:
             v_sample = truncated.truncated_normal(
-                    size=(self.batch_size, self.n_v),
+                    size=(size, self.n_v),
                     avg = v_mean, 
                     std = T.sqrt(1./self.lambd_prec),
                     lbound = -self.truncation_bound['v'],
@@ -622,7 +602,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                     dtype=floatX)
         else:
             v_sample = rng.normal(
-                    size=(self.batch_size, self.n_v),
+                    size=(size, self.n_v),
                     avg = v_mean, 
                     std = T.sqrt(1./self.lambd_prec),
                     dtype=floatX)
