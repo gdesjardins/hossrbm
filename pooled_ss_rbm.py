@@ -66,7 +66,7 @@ class PooledSpikeSlabRBM(Model, Block):
         flags.setdefault('use_energy', False)
         flags.setdefault('norm_type', None)
         flags.setdefault('truncated_normal', False)
-        flags.setdefault('no_beta_interaction', False)
+        flags.setdefault('lambd_interaction', False)
         flags.setdefault('scalar_lambd', False)
         if len(flags.keys()) != 7:
             raise NotImplementedError('One or more flags are currently not implemented.')
@@ -311,6 +311,7 @@ class PooledSpikeSlabRBM(Model, Block):
         if self.flags['truncated_normal']:
             x = numpy.clip(x, -self.truncation_bound['v'], self.truncation_bound['v'])
         self.batch_train_func(x)
+        import pdb; pdb.set_trace()
 
         # accounting...
         self.examples_seen += self.batch_size
@@ -340,10 +341,10 @@ class PooledSpikeSlabRBM(Model, Block):
         Wv = self.Wv
         if self.flags['norm_type'] in ('unit', 'max_unit'):
             Wv *= self.scalar_norms
-        if self.flags['no_beta_interaction']:
-            temp = v_sample
-        else:
+        if self.flags['lambd_interaction']:
             temp = self.lambd_prec * v_sample
+        else:
+            temp = v_sample
         return T.dot(temp, Wv)
 
     def from_h(self, h_sample):
@@ -360,14 +361,14 @@ class PooledSpikeSlabRBM(Model, Block):
         from_h = self.from_h(h_sample)
         energy = -T.sum(s_sample * from_v * from_h, axis=1)
         energy += T.sum(0.5 * self.alpha_prec * s_sample**2, axis=1)
+        energy += T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
         energy -= T.sum(self.alpha_prec * self.mu * s_sample * from_h, axis=1)
         energy += T.sum(0.5 * self.alpha_prec * self.mu**2 * from_h, axis=1)
-        energy += T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
         energy -= T.dot(h_sample, self.hbias)
         return energy
 
     def free_energy(self, v_sample):
-        fe  = T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
+        fe = T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
         fe -= 0.5 * T.sum(T.log(2*numpy.pi / self.alpha_prec))
         h_mean = self.h_given_v_input(v_sample)
         fe -= T.sum(T.nnet.softplus(h_mean), axis=1)
@@ -394,7 +395,7 @@ class PooledSpikeSlabRBM(Model, Block):
         """
         Wv = self.scalar_norms * self.Wv
         from_v = T.dot(v_sample, Wv)
-        s_mean  = 0.5 * 1./self.alpha_prec * from_v**2
+        s_mean = 0.5 * 1./self.alpha_prec * from_v**2
         s_mean += from_v * self.mu
         h_mean = T.dot(s_mean, self.Wh.T) + self.hbias
         return h_mean
@@ -440,7 +441,7 @@ class PooledSpikeSlabRBM(Model, Block):
         Wv = self.scalar_norms * self.Wv
         from_h = self.from_h(h_sample)
         v_mean = T.dot(s_sample * from_h, Wv.T)
-        if self.flags['no_beta_interaction']:
+        if not self.flags['lambd_interaction']:
             v_mean *= 1./self.lambd_prec
         return v_mean
 
