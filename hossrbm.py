@@ -24,8 +24,7 @@ from pylearn2.models.model import Model
 from pylearn2.space import VectorSpace
 
 import truncated
-#import cost as costmod
-from utils import cost as utils_cost
+import cost as costmod
 from utils import tools
 from utils import sharedX, floatX, npy_floatX
 from true_gradient import true_gradient
@@ -277,11 +276,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         ##
         main_cost = [lcost, spcost, regcost]
 
-        learning_grads = utils_cost.compute_gradients(*main_cost)
-        learning_updates = utils_cost.get_updates(
-                learning_grads, self.lr, multipliers = None)
- 
-        """
         learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
 
         weight_updates = OrderedDict()
@@ -296,11 +290,10 @@ class BilinearSpikeSlabRBM(Model, Block):
         # BUILD UPDATES DICTIONARY FROM GRADIENTS
         ##
         learning_updates = costmod.get_updates(learning_grads)
-        """
         learning_updates.update(pos_updates)
         learning_updates.update(neg_updates)
         learning_updates.update({self.iter: self.iter+1})
-        #learning_updates.update(weight_updates)
+        learning_updates.update(weight_updates)
 
         # build theano function to train on a single minibatch
         self.batch_train_func = function([self.input], [],
@@ -639,7 +632,7 @@ class BilinearSpikeSlabRBM(Model, Block):
     ##################
     # SAMPLING STUFF #
     ##################
-    def pos_phase(self, v, init_state, n_steps=1, mean_field=False, eps=1e-2):
+    def pos_phase(self, v, init_state, n_steps=1, mean_field=False, eps=1e-3):
         """
         Mixed mean-field + sampling inference in positive phase.
         :param v: input being conditioned on
@@ -655,9 +648,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         def pos_mf_iteration(g1, h1, v, size):
             g2 = self.g_given_hv(h1, v)
             h2 = self.h_given_gv(g2, v)
-            return [g2, h2]
-            #return [g2, h2], theano.scan_module.until(
-                    #(0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
+            return [g2, h2], theano.scan_module.until(
+                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
 
         [new_g, new_h], updates = theano.scan(
                 pos_mf_iteration if mean_field else pos_gibbs_iteration,
@@ -759,7 +751,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         # build gradient of cost with respect to model parameters
         cte = pos_cte + neg_cte
 
-        return utils_cost.Cost(cost, self.params(), cte)
+        return costmod.Cost(cost, self.params(), cte)
 
 
     ##############################
@@ -789,7 +781,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             if self.flags['split_norm']:
                 params += [self.scalar_norms]
         cte = [pos_g, pos_h]
-        return utils_cost.Cost(cost, params, cte)
+        return costmod.Cost(cost, params, cte)
 
     def get_reg_cost(self, l2=None, l1=None):
         """
@@ -813,7 +805,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                 cost += l2[p.name] * T.sum(p**2)
                 params += [p]
             
-        return utils_cost.Cost(cost, params)
+        return costmod.Cost(cost, params)
 
     def monitor_matrix(self, w, name=None):
         if name is None: assert hasattr(w, 'name')
