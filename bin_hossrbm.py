@@ -182,7 +182,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         self.force_batch_size = batch_size  # force minibatch size
 
         self.error_record = []
- 
+
         if compile: self.do_theano()
 
         #### load layer 1 parameters from file ####
@@ -376,6 +376,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
             constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
 
         return constraint_updates
+
     def train_batch(self, dataset, batch_size):
 
         x = dataset.get_batch_design(batch_size, include_labels=False)
@@ -422,29 +423,17 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h, s] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
+        [g, h] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
 
         atoms = {
                 'g_s' : T.dot(g, self.Wg),  # g in s-space
                 'h_s' : T.dot(h, self.Wh),  # h in s-space
-                's_g' : T.sqrt(T.dot(s**2, self.Wg.T)),
-                's_h' : T.sqrt(T.dot(s**2, self.Wh.T)),
-                's_g__h' : T.sqrt(T.dot(s**2 * T.dot(h, self.Wh), self.Wg.T)),
-                's_h__g' : T.sqrt(T.dot(s**2 * T.dot(g, self.Wg), self.Wh.T))
                 }
 
         output_prods = {
-                ## factored representations
                 'g' : g,
                 'h' : h,
                 'gh' : (g.dimshuffle(0,1,'x') * h.dimshuffle(0,'x',1)).flatten(ndim=2),
-                'gs': g * atoms['s_g'],
-                'hs': h * atoms['s_h'],
-                's_g': atoms['s_g'],
-                's_h': atoms['s_h'],
-                ## unfactored representations
-                'sg_s' : atoms['g_s'] * s,
-                'sh_s' : atoms['h_s'] * s,
                 }
 
         toks = output_type.split('+')
