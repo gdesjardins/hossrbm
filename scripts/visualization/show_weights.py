@@ -70,10 +70,10 @@ if opts.add_vbias:
 
 def plot(w):
 
-    nblocks = int(model.n_g / model.bw_g)
-    filters_per_block = model.bw_g * model.bw_h
+    nblocks = int(model.n_g / model.sparse_gmask.bw_g)
+    filters_per_block = model.sparse_gmask.bw_g * model.sparse_hmask.bw_h
 
-    block_viewer = PatchViewer((model.bw_g, model.bw_h),
+    block_viewer = PatchViewer((model.sparse_gmask.bw_g, model.sparse_hmask.bw_h),
                                (opts.height, opts.width),
                                is_color = opts.color,
                                pad=(2,2))
