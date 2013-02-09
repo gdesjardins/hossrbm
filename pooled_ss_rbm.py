@@ -205,7 +205,6 @@ class PooledSpikeSlabRBM(Model, Block):
         # moving average values for sparsity
         self.sp_pos_v = sharedX(neg_v, name='sp_pos_v')
         self.sp_pos_h = sharedX(neg_h, name='sp_pos_h')
-        import pdb; pdb.set_trace()
  
     def params(self):
         """
@@ -498,7 +497,6 @@ class PooledSpikeSlabRBM(Model, Block):
         return updates
 
     def ml_cost(self, pos_v, neg_v):
-        import pdb; pdb.set_trace()
         pos_cost = T.sum(self.free_energy(pos_v))
         neg_cost = T.sum(self.free_energy(neg_v))
         batch_cost = pos_cost - neg_cost
@@ -604,5 +602,4 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
         # reset neg_v markov chain accordingly
         neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
         model.neg_v.set_value(neg_v.astype(floatX))
-        import pdb; pdb.set_trace()
         super(TrainingAlgorithm, self).setup(model, dataset)
