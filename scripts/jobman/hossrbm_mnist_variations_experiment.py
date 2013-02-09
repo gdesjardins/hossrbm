@@ -90,6 +90,7 @@ yaml_string = """
                     'wv_norm': {wv_norm},
                     'split_norm': {split_norm},
                     'mean_field': {mean_field},
+                    'ml_lambd': {ml_lambd},
                 }},
                 "lr_spec"  : {{
                     'type': 'linear',
@@ -137,7 +138,7 @@ yaml_string = """
     }},
     "algorithm": !obj:ssrbm.pooled_ss_rbm.TrainingAlgorithm {{
                "batch_size": *batch_size,
-               "batches_per_iter" : 100,
+               "batches_per_iter" : 1000,
                "monitoring_batches": 11,
                "monitoring_dataset": *data,
     }},
