@@ -16,7 +16,7 @@ HYPER="$HYPER sp_targ_g=0.2 sp_targ_h=0.2"
 HYPER="$HYPER save_every=100000 max_updates=1000000"
 
 
-for n_g in 500 1000
+for n_g in 501 1002
 do
     for sp_weight in 0. 0.1
     do
