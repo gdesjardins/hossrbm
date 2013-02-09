@@ -18,9 +18,9 @@ HYPER="$HYPER save_every=100000 max_updates=1000000"
 
 for n_g in 500 1000
 do
-    for sp_weight in 0 0.1
+    for sp_weight in 0. 0.1
     do
-        for wv_norm in ['none','max_unit']
+        for wv_norm in 'none' 'max_unit'
         do
             for iscale_alpha in -2. 1.
             do
