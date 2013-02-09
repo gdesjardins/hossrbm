@@ -219,8 +219,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_s  = self.rng.normal(loc=loc, scale=scale, size=(self.batch_size, self.n_s))
         self.neg_s  = sharedX(neg_s, name='neg_s')
         # initialize binary g-h chains
-        neg_h = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_h))
-        neg_g = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_g))
+        neg_g = self.rng.binomial(n=1, p=self.gbias.get_value(), size=(self.batch_size, self.n_g))
+        neg_h = self.rng.binomial(n=1, p=self.hbias.get_value(), size=(self.batch_size, self.n_h))
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_g  = sharedX(neg_g, name='neg_g')
  

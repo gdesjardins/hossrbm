@@ -246,9 +246,9 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
         # initialize binary g-h chains
-        neg_g = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_g))
-        neg_h = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_h))
-        neg_v = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_v))
+        neg_g = self.rng.binomial(n=1, p=self.gbias.get_value(), size=(self.batch_size, self.n_g))
+        neg_h = self.rng.binomial(n=1, p=self.hbias.get_value(), size=(self.batch_size, self.n_h))
+        neg_v = self.rng.binomial(n=1, p=self.vbias.get_value(), size=(self.batch_size, self.n_v))
         self.neg_g  = sharedX(neg_g, name='neg_g')
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_v  = sharedX(neg_v, name='neg_v')
@@ -792,4 +792,5 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
         x = dataset.get_batch_design(10000, include_labels=False)
         ml_vbias = rbm_utils.compute_ml_bias(x)
         model.vbias.set_value(ml_vbias)
+        neg_v = model.rng.binomial(n=1, p=model.vbias.get_value(), size=(model.batch_size, model.n_v))
         super(TrainingAlgorithm, self).setup(model, dataset)
