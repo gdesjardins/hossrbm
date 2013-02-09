@@ -46,7 +46,7 @@ sparse_masks =\
 svm_callback =\
     """
     !obj:pipelines.svm.svm_on_features.pylearn2_svm_callback {{
-        "run_every": 5000,
+        "run_every": 100000,
         "svm": !obj:scikits.learn.svm.LinearSVC {{
             "loss": 'l2',
             "penalty": 'l2',
