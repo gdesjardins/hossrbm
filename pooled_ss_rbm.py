@@ -64,7 +64,7 @@ class PooledSpikeSlabRBM(Model, Block):
         flags.setdefault('split_norm', False)
         flags.setdefault('use_cd', False)
         flags.setdefault('use_energy', False)
-        flags.setdefault('norm_type', None)
+        flags.setdefault('wv_norm', None)
         flags.setdefault('truncated_normal', False)
         flags.setdefault('lambd_interaction', False)
         flags.setdefault('scalar_lambd', False)
@@ -275,12 +275,12 @@ class PooledSpikeSlabRBM(Model, Block):
             constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
 
         # constraint filters to have unit norm
-        if self.flags['norm_type'] in ('unit', 'max_unit'):
+        if self.flags['wv_norm'] in ('unit', 'max_unit'):
             wv = constraint_updates.get(self.Wv, self.Wv)
             wv_norm = T.sqrt(T.sum(wv**2, axis=0))
-            if self.flags['norm_type'] == 'unit':
+            if self.flags['wv_norm'] == 'unit':
                 constraint_updates[self.Wv] = wv / wv_norm
-            elif self.flags['norm_type'] == 'max_unit':
+            elif self.flags['wv_norm'] == 'max_unit':
                 constraint_updates[self.Wv] = wv / wv_norm * T.minimum(wv_norm, 1.0)
 
         constraint_updates[self.scalar_norms] = T.maximum(1.0, self.scalar_norms)
@@ -311,7 +311,6 @@ class PooledSpikeSlabRBM(Model, Block):
         if self.flags['truncated_normal']:
             x = numpy.clip(x, -self.truncation_bound['v'], self.truncation_bound['v'])
         self.batch_train_func(x)
-        import pdb; pdb.set_trace()
 
         # accounting...
         self.examples_seen += self.batch_size
@@ -339,7 +338,7 @@ class PooledSpikeSlabRBM(Model, Block):
 
     def from_v(self, v_sample):
         Wv = self.Wv
-        if self.flags['norm_type'] in ('unit', 'max_unit'):
+        if self.flags['split_norm']:
             Wv *= self.scalar_norms
         if self.flags['lambd_interaction']:
             temp = self.lambd_prec * v_sample
@@ -606,7 +605,7 @@ class PooledSpikeSlabRBM(Model, Block):
                 name + '.absmean': abs(b).mean()}
 
     def get_monitoring_channels(self, x, y=None):
-        chans = {}
+        chans = OrderedDict()
         chans.update(self.monitor_matrix(self.Wv))
         chans.update(self.monitor_vector(self.scalar_norms))
         chans.update(self.monitor_vector(self.hbias))
