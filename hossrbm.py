@@ -29,6 +29,9 @@ from utils import tools
 from utils import sharedX, floatX, npy_floatX
 from true_gradient import true_gradient
 
+def sigm(x): return 1./(1 + numpy.exp(-x))
+def softplus(x): return numpy.log(1. + numpy.exp(x))
+def softplus_inv(x): return numpy.log(numpy.exp(x) - 1.)
 
 class BilinearSpikeSlabRBM(Model, Block):
     """Spike & Slab Restricted Boltzmann Machine (RBM)  """
@@ -70,7 +73,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('wv_norm', 'none')
         flags.setdefault('split_norm', False)
         flags.setdefault('mean_field', False)
-        if len(flags.keys()) != 9:
+        flags.setdefault('ml_lambd', False)
+        if len(flags.keys()) != 10:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
@@ -138,7 +142,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         if lr_spec['type'] == 'anneal':
             num = lr_spec['init'] * lr_spec['start'] 
-            pos = T.maximum(lr_spec['start'], lr_spec['slope'] * self.iter)
+            denum = T.maximum(lr_spec['start'], lr_spec['slope'] * self.iter)
             self.lr = T.maximum(lr_spec['floor'], num/denum) 
         elif lr_spec['type'] == 'linear':
             lr_start = npy_floatX(lr_spec['start'])
@@ -208,7 +212,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
-        def softplus(x): return numpy.log(1. + numpy.exp(x))
         # initialize visible unit chains
         scale = numpy.sqrt(1./softplus(self.lambd.get_value()))
         neg_v  = self.rng.normal(loc=0, scale=scale, size=(self.batch_size, self.n_v))
@@ -219,8 +222,10 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_s  = self.rng.normal(loc=loc, scale=scale, size=(self.batch_size, self.n_s))
         self.neg_s  = sharedX(neg_s, name='neg_s')
         # initialize binary g-h chains
-        neg_g = self.rng.binomial(n=1, p=self.gbias.get_value(), size=(self.batch_size, self.n_g))
-        neg_h = self.rng.binomial(n=1, p=self.hbias.get_value(), size=(self.batch_size, self.n_h))
+        pval_g = sigm(self.gbias.get_value())
+        pval_h = sigm(self.hbias.get_value())
+        neg_g = self.rng.binomial(n=1, p=pval_g, size=(self.batch_size, self.n_g))
+        neg_h = self.rng.binomial(n=1, p=pval_h, size=(self.batch_size, self.n_h))
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_g  = sharedX(neg_g, name='neg_g')
  
@@ -832,4 +837,12 @@ class BilinearSpikeSlabRBM(Model, Block):
 class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
 
     def setup(self, model, dataset):
+        if model.flags['ml_lambd']:
+            # compute maximum likelihood solution for lambd
+            x = dataset.get_batch_design(10000, include_labels=False)
+            scale = (1./numpy.std(x, axis=0))**2
+            model.lambd.set_value(softplus_inv(scale).astype(floatX))
+            # reset neg_v markov chain accordingly
+            neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
+            model.neg_v.set_value(neg_v.astype(floatX))
         super(TrainingAlgorithm, self).setup(model, dataset)

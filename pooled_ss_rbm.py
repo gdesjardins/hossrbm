@@ -71,7 +71,8 @@ class PooledSpikeSlabRBM(Model, Block):
         flags.setdefault('truncated_normal', False)
         flags.setdefault('lambd_interaction', False)
         flags.setdefault('scalar_lambd', False)
-        if len(flags.keys()) != 7:
+        flags.setdefault('ml_lambd', False)
+        if len(flags.keys()) != 8:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, numpy_rng = None, theano_rng = None,
@@ -595,11 +596,12 @@ class PooledSpikeSlabRBM(Model, Block):
 class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
 
     def setup(self, model, dataset):
-        # compute maximum likelihood solution for lambd
-        x = dataset.get_batch_design(10000, include_labels=False)
-        scale = (1./numpy.std(x, axis=0))**2
-        model.lambd.set_value(softplus_inv(scale).astype(floatX))
-        # reset neg_v markov chain accordingly
-        neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
-        model.neg_v.set_value(neg_v.astype(floatX))
+        if model.flags['ml_lambd']:
+            # compute maximum likelihood solution for lambd
+            x = dataset.get_batch_design(10000, include_labels=False)
+            scale = (1./numpy.std(x, axis=0))**2
+            model.lambd.set_value(softplus_inv(scale).astype(floatX))
+            # reset neg_v markov chain accordingly
+            neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
+            model.neg_v.set_value(neg_v.astype(floatX))
         super(TrainingAlgorithm, self).setup(model, dataset)
