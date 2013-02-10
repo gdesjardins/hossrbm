@@ -264,7 +264,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
 
             # POSITIVE PHASE
             pos_states, pos_updates = self.pos_phase_updates(
-                    self.input, input_label,
+                    self.input, l = input_label,
                     n_steps = self.pos_steps,
                     mean_field=self.flags['mean_field'])
 
@@ -644,7 +644,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         assert mean_field
 
         def pos_mf_iteration(g1, h1, l1, v, size):
-            l2 = self.h_given_gvl(g1, v, l1)
+            l2 = self.l_given_h(h1)
             h2 = self.h_given_gvl(g1, v, l2)
             g2 = self.g_given_hv(h2, v)
             return [g2, h2, l2], theano.scan_module.until(
@@ -675,6 +675,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         Implements the positive phase sampling, which performs blocks Gibbs
         sampling in order to sample from p(g,h,x,y|v).
         :param v: fixed training set
+        :param l: l is None means we sample l, l not None means we clamp l.
         :param init: dictionary of initial values, or None if sampling from scratch
         :param n_steps: scalar, number of Gibbs steps to perform.
         :param restart: if False, start sampling from buffers self.pos_*
@@ -857,11 +858,18 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         chans.update(self.monitor_matrix(self.neg_l))
         wg_norm = T.sqrt(T.sum(self.Wg**2, axis=0))
         wh_norm = T.sqrt(T.sum(self.Wh**2, axis=0))
+        whl_norm = T.sqrt(T.sum(self.Whl**2, axis=0))
         wv_norm = T.sqrt(T.sum(self.Wv**2, axis=0))
         chans.update(self.monitor_vector(wg_norm, name='wg_norm'))
         chans.update(self.monitor_vector(wh_norm, name='wh_norm'))
+        chans.update(self.monitor_vector(whl_norm, name='whl_norm'))
         chans.update(self.monitor_vector(wv_norm, name='wv_norm'))
         chans['lr'] = self.lr
+        # monitor energy vs. label energy
+        fe, cte  = self.free_energy(self.neg_g, self.neg_h, self.neg_v, self.neg_l)
+        label_fe = T.mean(self.label_energy(self.neg_h, self.neg_l))
+        chans['energy'] = fe
+        chans['label_energy'] = label_fe
         return chans
 
 

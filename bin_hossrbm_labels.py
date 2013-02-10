@@ -27,6 +27,7 @@ import truncated
 import cost as costmod
 from utils import tools
 from utils import sharedX, floatX, npy_floatX
+from utils import rbm_utils
 from true_gradient import true_gradient
 
 def sigm(x): return 1./(1 + numpy.exp(-x))
@@ -37,7 +38,7 @@ def softmax(x):
     max_x = numpy.max(x)
     return numpy.exp(x - max_x) / numpy.sum(numpy.exp(x - max_x))
 
-class BilinearSpikeSlabRBMWithLabels(Model, Block):
+class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
     """Spike & Slab Restricted Boltzmann Machine (RBM)  """
 
     def load_params(self, model):
@@ -229,7 +230,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         neg_v = self.rng.binomial(n=1, p=pval_v, size=(self.batch_size, self.n_v))
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_g  = sharedX(neg_g, name='neg_g')
-        self.neg_v  = sharedX(neg_l, name='neg_v')
+        self.neg_v  = sharedX(neg_v, name='neg_v')
         # initialize multinomial l-chains
         pval_l = softmax(self.lbias.get_value())
         neg_l = self.rng.multinomial(n=1, pvals=pval_l, size=(self.batch_size))
@@ -260,7 +261,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
 
             # POSITIVE PHASE
             pos_states, pos_updates = self.pos_phase_updates(
-                    self.input, input_label,
+                    self.input, l = input_label,
                     n_steps = self.pos_steps,
                     mean_field=self.flags['mean_field'])
 
@@ -618,7 +619,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         assert mean_field
 
         def pos_mf_iteration(g1, h1, l1, v, size):
-            l2 = self.h_given_gvl(g1, v, l1)
+            l2 = self.l_given_h(h1)
             h2 = self.h_given_gvl(g1, v, l2)
             g2 = self.g_given_hv(h2, v)
             return [g2, h2, l2], theano.scan_module.until(
@@ -649,6 +650,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         Implements the positive phase sampling, which performs blocks Gibbs
         sampling in order to sample from p(g,h,x,y|v).
         :param v: fixed training set
+        :param l: l is None means we sample l, l not None means we clamp l.
         :param init: dictionary of initial values, or None if sampling from scratch
         :param n_steps: scalar, number of Gibbs steps to perform.
         :param restart: if False, start sampling from buffers self.pos_*
@@ -831,11 +833,18 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         chans.update(self.monitor_matrix(self.neg_l))
         wg_norm = T.sqrt(T.sum(self.Wg**2, axis=0))
         wh_norm = T.sqrt(T.sum(self.Wh**2, axis=0))
+        whl_norm = T.sqrt(T.sum(self.Whl**2, axis=0))
         wv_norm = T.sqrt(T.sum(self.Wv**2, axis=0))
         chans.update(self.monitor_vector(wg_norm, name='wg_norm'))
         chans.update(self.monitor_vector(wh_norm, name='wh_norm'))
+        chans.update(self.monitor_vector(whl_norm, name='whl_norm'))
         chans.update(self.monitor_vector(wv_norm, name='wv_norm'))
         chans['lr'] = self.lr
+        # monitor energy vs. label energy
+        fe, cte  = self.free_energy(self.neg_g, self.neg_h, self.neg_v, self.neg_l)
+        label_fe = T.mean(self.label_energy(self.neg_h, self.neg_l))
+        chans['energy'] = fe
+        chans['label_energy'] = label_fe
         return chans
 
 
@@ -847,5 +856,5 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
         model.vbias.set_value(ml_vbias)
         pval_v = sigm(model.vbias.get_value())
         neg_v = model.rng.binomial(n=1, p=pval_v, size=(model.batch_size, model.n_v))
-        model.neg_v.set_value(neg_v)
+        model.neg_v.set_value(neg_v.astype(floatX))
         super(TrainingAlgorithm, self).setup(model, dataset)
