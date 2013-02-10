@@ -1,0 +1,6 @@
+mnist-background-image
+
+desjagui_db=> select id, jobman_status, ng, spweightg, iscalealpha,
+least(valerr100000, valerr200000, valerr300000, valerr400000, valerr500000,
+valerr600000) as bestval from icml13_mnistbackimg_hossrbmtrial_view order by
+bestval asc;
