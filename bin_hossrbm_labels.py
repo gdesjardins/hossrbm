@@ -23,15 +23,21 @@ from pylearn2.base import Block
 from pylearn2.models.model import Model
 from pylearn2.space import VectorSpace
 
+import truncated
 import cost as costmod
 from utils import tools
-from utils import rbm_utils
 from utils import sharedX, floatX, npy_floatX
 from true_gradient import true_gradient
-import bin_hossrbm
 
+def sigm(x): return 1./(1 + numpy.exp(-x))
+def softplus(x): return numpy.log(1. + numpy.exp(x))
+def softplus_inv(x): return numpy.log(numpy.exp(x) - 1.)
+def softmax(x):
+    assert x.ndim == 1
+    max_x = numpy.max(x)
+    return numpy.exp(x - max_x) / numpy.sum(numpy.exp(x - max_x))
 
-class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
+class BilinearSpikeSlabRBMWithLabels(Model, Block):
     """Spike & Slab Restricted Boltzmann Machine (RBM)  """
 
     def load_params(self, model):
@@ -61,21 +67,26 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         self.iter.set_value(model.iter.get_value())
 
     def validate_flags(self, flags):
+        flags.setdefault('truncate_s', False)
+        flags.setdefault('truncate_v', False)
+        flags.setdefault('scalar_lambd', False)
+        flags.setdefault('lambd_interaction', False)
         flags.setdefault('wg_norm', 'none')
         flags.setdefault('wh_norm', 'none')
         flags.setdefault('wv_norm', 'none')
         flags.setdefault('split_norm', False)
         flags.setdefault('mean_field', False)
-        if len(flags.keys()) != 5:
+        flags.setdefault('ml_lambd', False)
+        if len(flags.keys()) != 10:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
             numpy_rng = None, theano_rng = None,
-            n_l=10, n_g=99, n_h=99, n_s=None, n_v=100, init_from=None,
+            n_g=99, n_h=99, n_l=10, n_s=99, n_v=100, label_multiplier=10., init_from=None,
             sparse_gmask = None, sparse_hmask = None,
             pos_steps=1, neg_sample_steps=1,
             lr_spec=None, lr_timestamp=None, lr_mults = {},
-            iscales={}, clip_min={}, clip_max={},
+            iscales={}, clip_min={}, clip_max={}, truncation_bound={},
             l1 = {}, l2 = {},
             sp_weight={}, sp_targ={},
             batch_size = 13,
@@ -126,7 +137,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         ############### ALLOCATE PARAMETERS #################
         # allocate symbolic variable for input
         self.input = T.matrix('input')
-        self.input_labels = T.matrix('input')
+        self.input_labels = T.matrix('input_labels')
         self.init_parameters()
         self.init_chains()
 
@@ -135,7 +146,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
 
         if lr_spec['type'] == 'anneal':
             num = lr_spec['init'] * lr_spec['start'] 
-            pos = T.maximum(lr_spec['start'], lr_spec['slope'] * self.iter)
+            denum = T.maximum(lr_spec['start'], lr_spec['slope'] * self.iter)
             self.lr = T.maximum(lr_spec['floor'], num/denum) 
         elif lr_spec['type'] == 'linear':
             lr_start = npy_floatX(lr_spec['start'])
@@ -153,9 +164,8 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         self.force_batch_size = batch_size  # force minibatch size
 
         self.error_record = []
-
+ 
         if compile: self.do_theano()
-        self.baby = bin_hossrbm.BilinearSpikeSlabRBM.init_from_model(self)
 
         #### load layer 1 parameters from file ####
         if init_from:
@@ -195,9 +205,8 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
-        self.vbias = sharedX(self.iscales['vbias'] * numpy.ones(self.n_v), name='vbias')
         self.lbias = sharedX(self.iscales['lbias'] * numpy.ones(self.n_l), name='lbias')
-        self.label_multiplier = 10.
+        self.vbias = sharedX(self.iscales['vbias'] * numpy.ones(self.n_v), name='vbias')
 
         # mean (mu) and precision (alpha) parameters on s
         self.mu = sharedX(self.iscales['mu'] * numpy.ones(self.n_s), name='mu')
@@ -206,21 +215,25 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
-        # initialize binary g-h chains
-        neg_g = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_g))
-        neg_h = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_h))
-        neg_v = self.rng.randint(low=0, high=2, size=(self.batch_size, self.n_v))
-        neg_l = self.rng.multinomial(n=1, pvals=T.nnet.softmax(self.lbias), size=(self.batch_size))
-        self.neg_g  = sharedX(neg_g, name='neg_g')
-        self.neg_h  = sharedX(neg_h, name='neg_h')
-        self.neg_v  = sharedX(neg_v, name='neg_v')
-        self.neg_l  = sharedX(neg_l, name='neg_l')
         # initialize s-chain
-        def softplus(x): return numpy.log(1. + numpy.exp(x))
         loc = self.mu.get_value()
         scale = numpy.sqrt(1./softplus(self.alpha.get_value()))
         neg_s  = self.rng.normal(loc=loc, scale=scale, size=(self.batch_size, self.n_s))
         self.neg_s  = sharedX(neg_s, name='neg_s')
+        # initialize binary g-h-v chains
+        pval_g = sigm(self.gbias.get_value())
+        pval_h = sigm(self.hbias.get_value())
+        pval_v = sigm(self.vbias.get_value())
+        neg_g = self.rng.binomial(n=1, p=pval_g, size=(self.batch_size, self.n_g))
+        neg_h = self.rng.binomial(n=1, p=pval_h, size=(self.batch_size, self.n_h))
+        neg_v = self.rng.binomial(n=1, p=pval_v, size=(self.batch_size, self.n_v))
+        self.neg_h  = sharedX(neg_h, name='neg_h')
+        self.neg_g  = sharedX(neg_g, name='neg_g')
+        self.neg_v  = sharedX(neg_l, name='neg_v')
+        # initialize multinomial l-chains
+        pval_l = softmax(self.lbias.get_value())
+        neg_l = self.rng.multinomial(n=1, pvals=pval_l, size=(self.batch_size))
+        self.neg_l  = sharedX(neg_l, name='neg_l')
  
     def params(self):
         """
@@ -241,65 +254,61 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         neg_updates = self.neg_sampling_updates(n_steps=self.neg_sample_steps, use_pcd=True)
         self.sample_func = theano.function([], [], updates=neg_updates)
 
-        energy = T.mean(self.free_energy(self.neg_g, self.neg_h, self.neg_v, self.neg_l))
-        label_energy = T.mean(self.label_energy(self.neg_h, self.neg_l))
-        self.energy_func = theano.function([], [energy, label_energy])
+        ### BUILD TWO FUNCTIONS: ONE CONDITIONED ON LABELS, ONE WHERE LABELS ARE SAMPLED
+        self.batch_train_func = {}
+        for (key, input_label) in zip(['nolabel','label'], [None, self.input_labels]):
 
-        # POSITIVE PHASE
-        pos_states, pos_updates = self.pos_phase_updates(
-                self.input,
-                self.input_labels,
-                n_steps = self.pos_steps,
-                mean_field=self.flags['mean_field'])
+            # POSITIVE PHASE
+            pos_states, pos_updates = self.pos_phase_updates(
+                    self.input, input_label,
+                    n_steps = self.pos_steps,
+                    mean_field=self.flags['mean_field'])
 
-        ##
-        # BUILD COST OBJECTS
-        ##
-        lcost = self.ml_cost(
-                        pos_g = pos_states['g'],
-                        pos_h = pos_states['h'],
-                        pos_v = self.input,
-                        pos_l = self.input_labels,
-                        neg_g = neg_updates[self.neg_g],
-                        neg_h = neg_updates[self.neg_h],
-                        neg_v = neg_updates[self.neg_v],
-                        neg_l = neg_updates[self.neg_l],
-                        mean_field=self.flags['mean_field'])
+            ##
+            # BUILD COST OBJECTS
+            ##
+            lcost = self.ml_cost(
+                            pos_g = pos_states['g'],
+                            pos_h = pos_states['h'],
+                            pos_l = pos_states['l'],
+                            pos_v = self.input,
+                            neg_g = neg_updates[self.neg_g],
+                            neg_h = neg_updates[self.neg_h],
+                            neg_v = neg_updates[self.neg_v],
+                            neg_l = neg_updates[self.neg_l],
+                            mean_field=self.flags['mean_field'])
+            spcost = self.get_sparsity_cost(pos_states['g'], pos_states['h'], pos_states['l'])
+            regcost = self.get_reg_cost(self.l2, self.l1)
 
-        spcost = self.get_sparsity_cost(
-                pos_states['g'],
-                pos_states['h'])
+            ##
+            # COMPUTE GRADIENTS WRT. COSTS
+            ##
+            main_cost = [lcost, spcost, regcost]
 
-        regcost = self.get_reg_cost(self.l2, self.l1)
+            learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
 
-        ##
-        # COMPUTE GRADIENTS WRT. COSTS
-        ##
-        main_cost = [lcost, spcost, regcost]
+            weight_updates = OrderedDict()
+            if self.flags['wg_norm'] == 'unit' and self.Wg in self.params():
+                weight_updates[self.Wg] = true_gradient(self.Wg, -learning_grads[self.Wg])
+            if self.flags['wh_norm'] == 'unit' and self.Wh in self.params():
+                weight_updates[self.Wh] = true_gradient(self.Wh, -learning_grads[self.Wh])
+            if self.flags['wv_norm'] == 'unit':
+                weight_updates[self.Wv] = true_gradient(self.Wv, -learning_grads[self.Wv])
 
-        learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
+            ##
+            # BUILD UPDATES DICTIONARY FROM GRADIENTS
+            ##
+            learning_updates = costmod.get_updates(learning_grads)
+            learning_updates.update(pos_updates)
+            learning_updates.update(neg_updates)
+            learning_updates.update({self.iter: self.iter+1})
+            learning_updates.update(weight_updates)
 
-        weight_updates = OrderedDict()
-        if self.flags['wg_norm'] == 'unit' and self.Wg in self.params():
-            weight_updates[self.Wg] = true_gradient(self.Wg, -learning_grads[self.Wg])
-        if self.flags['wh_norm'] == 'unit' and self.Wh in self.params():
-            weight_updates[self.Wh] = true_gradient(self.Wh, -learning_grads[self.Wh])
-        if self.flags['wv_norm'] == 'unit':
-            weight_updates[self.Wv] = true_gradient(self.Wv, -learning_grads[self.Wv])
-
-        ##
-        # BUILD UPDATES DICTIONARY FROM GRADIENTS
-        ##
-        learning_updates = costmod.get_updates(learning_grads)
-        learning_updates.update(pos_updates)
-        learning_updates.update(neg_updates)
-        learning_updates.update({self.iter: self.iter+1})
-        learning_updates.update(weight_updates)
-
-        # build theano function to train on a single minibatch
-        self.batch_train_func = function([self.input, self.input_labels], [],
-                                         updates=learning_updates,
-                                         name='train_rbm_func')
+            # build theano function to train on a single minibatch
+            inputs = [self.input, self.input_labels] if key == 'label' else [self.input]
+            self.batch_train_func[key] = function(inputs, [],
+                                             updates=learning_updates,
+                                             name='train_rbm_func_%s' % key)
 
         #######################
         # CONSTRAINT FUNCTION #
@@ -316,6 +325,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
 
     def get_constraint_updates(self):
         constraint_updates = OrderedDict() 
+
         if self.Wg in self.params():
             norm_wg = T.sqrt(T.sum(self.Wg**2, axis=0))
             if self.flags['wg_norm'] == 'roland':
@@ -353,14 +363,13 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
 
     def train_batch(self, dataset, batch_size):
 
-        rval = dataset.get_batch_design(batch_size, include_labels=True)
-        if rval[1] is None:
-            self.baby.batch_train_func(rval[0])
-            self.sample_func()
+        (x, y) = dataset.get_batch_design(batch_size, include_labels=True)
+        if self.flags['truncate_v']:
+            x = numpy.clip(x, -self.truncation_bound['v'], self.truncation_bound['v'])
+        if y is None:
+            self.batch_train_func['nolabel'](x)
         else:
-            self.batch_train_func(rval[0], rval[1])
-            self.baby.sample_func()
-
+            self.batch_train_func['label'](x, y)
         self.enforce_constraints()
 
         # accounting...
@@ -381,9 +390,10 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
     def free_energy(self, g_sample, h_sample, v_sample, l_sample):
         """
         Computes energy for a given configuration of (g,h,v,x,y).
-        :param g_sample: T.matrix of shape (batch_size, n_g)
+        :param h_sample: T.matrix of shape (batch_size, n_g)
         :param h_sample: T.matrix of shape (batch_size, n_h)
         :param v_sample: T.matrix of shape (batch_size, n_v)
+        :param l_sample: T.matrix of shape (batch_size, n_l)
         """
         from_v = self.from_v(v_sample)
         from_h = self.from_h(h_sample)
@@ -395,7 +405,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         energy -= T.dot(h_sample, self.hbias)
         energy -= T.dot(v_sample, self.vbias)
         energy += self.label_energy(h_sample, l_sample)
-        return T.mean(energy), [g_sample, h_sample, v_sample]
+        return T.mean(energy), [g_sample, h_sample, v_sample, l_sample]
 
     def label_energy(self, h_sample, l_sample):
         energy = -T.sum(l_sample * T.dot(h_sample, self.Whl), axis=1)
@@ -407,30 +417,32 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h] = self.baby.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
+        init_state['l'] = T.ones((v.shape[0],self.n_l)) * T.nnet.softmax(self.lbias)
+        [g, h, l] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
+        s = self.s_given_ghv(g, h, v)
 
         atoms = {
-                'g_s' : T.dot(g, self.Wg),  # g in s-space
-                'h_s' : T.dot(h, self.Wh),  # h in s-space
-                's_g' : T.sqrt(T.dot(s**2, self.Wg.T)),
-                's_h' : T.sqrt(T.dot(s**2, self.Wh.T)),
-                's_g__h' : T.sqrt(T.dot(s**2 * T.dot(h, self.Wh), self.Wg.T)),
-                's_h__g' : T.sqrt(T.dot(s**2 * T.dot(g, self.Wg), self.Wh.T))
-                }
+            'g_s' : T.dot(g, self.Wg),  # g in s-space
+            'h_s' : T.dot(h, self.Wh),  # h in s-space
+            's_g' : T.sqrt(T.dot(s**2, self.Wg.T)),
+            's_h' : T.sqrt(T.dot(s**2, self.Wh.T)),
+            's_g__h' : T.sqrt(T.dot(s**2 * T.dot(h, self.Wh), self.Wg.T)),
+            's_h__g' : T.sqrt(T.dot(s**2 * T.dot(g, self.Wg), self.Wh.T))
+        }
 
         output_prods = {
-                ## factored representations
-                'g' : g,
-                'h' : h,
-                'gh' : (g.dimshuffle(0,1,'x') * h.dimshuffle(0,'x',1)).flatten(ndim=2),
-                'gs': g * atoms['s_g'],
-                'hs': h * atoms['s_h'],
-                's_g': atoms['s_g'],
-                's_h': atoms['s_h'],
-                ## unfactored representations
-                'sg_s' : atoms['g_s'] * s,
-                'sh_s' : atoms['h_s'] * s,
-                }
+            ## factored representations
+            'g' : g,
+            'h' : h,
+            'gh' : (g.dimshuffle(0,1,'x') * h.dimshuffle(0,'x',1)).flatten(ndim=2),
+            'gs': g * atoms['s_g'],
+            'hs': h * atoms['s_h'],
+            's_g': atoms['s_g'],
+            's_h': atoms['s_h'],
+            ## unfactored representations
+            'sg_s' : atoms['g_s'] * s,
+            'sh_s' : atoms['h_s'] * s,
+        }
 
         toks = output_type.split('+')
         output = output_prods[toks[0]]
@@ -479,7 +491,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         l_sample = rng.multinomial(size=(size,self.n_l), n=1,
             pvals=l_mean, dtype=floatX)
         return l_sample
-   
+ 
     def h_given_gvl_input(self, g_sample, v_sample, l_sample):
         """
         Compute mean activation of h given v.
@@ -502,7 +514,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         """
         Generates sample from p(h | g, v)
         """
-        h_mean = self.h_given_gvl(g_sample, v_sample, l_sample=l_sample)
+        h_mean = self.h_given_gvl(g_sample, v_sample, l_sample)
 
         rng = self.theano_rng if rng is None else rng
         size = size if size else self.batch_size
@@ -551,11 +563,22 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         
         rng = self.theano_rng if rng is None else rng
         size = size if size else self.batch_size
-        s_sample = rng.normal(
-                size=(size, self.n_s),
-                avg = s_mean, 
-                std = T.sqrt(1./self.alpha_prec),
-                dtype=floatX)
+
+        if self.flags['truncate_s']:
+            s_sample = truncated.truncated_normal(
+                    size=(size, self.n_s),
+                    avg = s_mean, 
+                    std = T.sqrt(1./self.alpha_prec),
+                    lbound = self.mu - self.truncation_bound['s'],
+                    ubound = self.mu + self.truncation_bound['s'],
+                    theano_rng = rng,
+                    dtype=floatX)
+        else: 
+            s_sample = rng.normal(
+                    size=(size, self.n_s),
+                    avg = s_mean, 
+                    std = T.sqrt(1./self.alpha_prec),
+                    dtype=floatX)
         return s_sample
 
     def v_given_ghs(self, g_sample, h_sample, s_sample):
@@ -585,46 +608,68 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
     ##################
     # SAMPLING STUFF #
     ##################
+    def pos_phase(self, v, init_state, l=None, n_steps=1, mean_field=False, eps=1e-3):
+        """
+        Mixed mean-field + sampling inference in positive phase.
+        :param v: input being conditioned on
+        :param init: dictionary of initial values
+        :param n_steps: number of Gibbs updates to perform afterwards.
+        """
+        assert mean_field
 
-    def pos_phase(self, v, l, init_state, n_steps=1, mean_field=False):
+        def pos_mf_iteration(g1, h1, l1, v, size):
+            l2 = self.h_given_gvl(g1, v, l1)
+            h2 = self.h_given_gvl(g1, v, l2)
+            g2 = self.g_given_hv(h2, v)
+            return [g2, h2, l2], theano.scan_module.until(
+                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
 
-        def pos_gibbs_iteration(g1, h1, v, l, size):
-            g2 = self.sample_g_given_hv(h1, v, size=size)
-            h2 = self.sample_h_given_gvl(g2, v, l, size=size)
-            return [g2, h2]
+        def pos_mf_iteration_labels(g1, h1, v, l, size):
+            h2 = self.h_given_gvl(g1, v, l)
+            g2 = self.g_given_hv(h2, v)
+            return [g2, h2], theano.scan_module.until(
+                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
 
-        def pos_mf_iteration(g1, h1, v, l, size):
-            g2 = self.g_given_hv(h1, v)
-            h2 = self.h_given_gvl(g2, v, l)
-            return [g2, h2]
+        iter_func = pos_mf_iteration if l is None else pos_mf_iteration_labels
+        non_sequences = [v, v.shape[0]] if l is None else [v, l, v.shape[0]]
+        outputs_info = [init_state['g'], init_state['h']]
+        if l is None:
+            outputs_info += [init_state['l']]
 
-        [new_g, new_h], updates = theano.scan(
-                pos_mf_iteration if mean_field else pos_gibbs_iteration,
-                outputs_info = [init_state['g'], init_state['h']],
-                non_sequences = [v, v.shape[0]],
+        outputs, updates = theano.scan(
+                iter_func,
+                outputs_info = outputs_info,
+                non_sequences = non_sequences,
                 n_steps=n_steps)
 
-        new_g = new_g[-1]
-        new_h = new_h[-1]
+        return [output[-1] for output in outputs]
 
-        return [new_g, new_h]
-
-
-    def pos_phase_updates(self, v, l, init_state=None, n_steps=1, mean_field=False):
+    def pos_phase_updates(self, v, l=None, init_state=None, n_steps=1, mean_field=False):
+        """
+        Implements the positive phase sampling, which performs blocks Gibbs
+        sampling in order to sample from p(g,h,x,y|v).
+        :param v: fixed training set
+        :param init: dictionary of initial values, or None if sampling from scratch
+        :param n_steps: scalar, number of Gibbs steps to perform.
+        :param restart: if False, start sampling from buffers self.pos_*
+        """
         if init_state is None:
             assert n_steps
+            # start sampler from scratch
             init_state = OrderedDict()
             init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
             init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
+            init_state['l'] = T.ones((self.batch_size,self.n_l)) * T.nnet.softmax(self.lbias)
 
-        [new_g, new_h] = self.pos_phase(v, l,
+        outputs = self.pos_phase(v, l=l,
                 init_state=init_state,
                 n_steps=n_steps,
                 mean_field=mean_field)
 
         pos_states = OrderedDict()
-        pos_states['g'] = new_g
-        pos_states['h'] = new_h
+        pos_states['g'] = outputs[0]
+        pos_states['h'] = outputs[1]
+        pos_states['l'] = outputs[2] if l is None else self.input_labels
 
         # update running average of positive phase activations
         pos_updates = OrderedDict()
@@ -637,7 +682,6 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         :param g_sample: T.matrix of shape (batch_size, n_g)
         :param h_sample: T.matrix of shape (batch_size, n_h)
         :param v_sample: T.matrix of shape (batch_size, n_v)
-        :param l_sample: T.matrix of shape (batch_size, n_l)
         :param n_steps: number of Gibbs updates to perform in negative phase.
         """
 
@@ -681,8 +725,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
 
         return updates
 
-    def ml_cost(self, pos_g, pos_h, pos_v, pos_l,
-                      neg_g, neg_h, neg_v, neg_l, mean_field=False):
+    def ml_cost(self, pos_g, pos_h, pos_v, pos_l, neg_g, neg_h, neg_v, neg_l, mean_field=False):
         """
         Variational approximation to the maximum likelihood positive phase.
         :param v: T.matrix of shape (batch_size, n_v), training examples
@@ -697,14 +740,15 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
 
         return costmod.Cost(cost, self.params(), cte)
 
+
     ##############################
     # GENERIC OPTIMIZATION STUFF #
     ##############################
-    def get_sparsity_cost(self, pos_g, pos_h):
+    def get_sparsity_cost(self, pos_g, pos_h, pos_l):
 
         # update mean activation using exponential moving average
         hack_g = self.g_given_hv(pos_h, self.input)
-        hack_h = self.h_given_gvl(pos_g, self.input, self.input_labels)
+        hack_h = self.h_given_gvl(pos_g, self.input, pos_l)
 
         # define loss based on value of sp_type
         eps = npy_floatX(1./self.batch_size)
@@ -714,7 +758,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         params = []
         cost = T.zeros((), dtype=floatX)
         if self.sp_weight['g'] or self.sp_weight['h']:
-            params += [self.Wv, self.alpha, self.mu]
+            params += [self.Wv, self.Whl, self.alpha, self.mu]
             if self.sp_weight['g']:
                 cost += self.sp_weight['g']  * T.sum(loss(self.sp_targ['g'], hack_g.mean(axis=0)))
                 params += [self.gbias]
@@ -782,24 +826,16 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         chans.update(self.monitor_vector(self.mu))
         chans.update(self.monitor_matrix(self.neg_g))
         chans.update(self.monitor_matrix(self.neg_h))
-        chans.update(self.monitor_matrix(self.neg_l))
         chans.update(self.monitor_matrix(self.neg_s - self.mu, name='(neg_s - mu)'))
         chans.update(self.monitor_matrix(self.neg_v))
+        chans.update(self.monitor_matrix(self.neg_l))
         wg_norm = T.sqrt(T.sum(self.Wg**2, axis=0))
         wh_norm = T.sqrt(T.sum(self.Wh**2, axis=0))
-        whl_norm = T.sqrt(T.sum(self.Whl**2, axis=0))
         wv_norm = T.sqrt(T.sum(self.Wv**2, axis=0))
         chans.update(self.monitor_vector(wg_norm, name='wg_norm'))
         chans.update(self.monitor_vector(wh_norm, name='wh_norm'))
-        chans.update(self.monitor_vector(whl_norm, name='whl_norm'))
         chans.update(self.monitor_vector(wv_norm, name='wv_norm'))
         chans['lr'] = self.lr
-
-        energy = T.mean(self.energy(self.neg_g, self.neg_h, self.neg_s, self.neg_v, self.neg_l))
-        label_energy = T.mean(self.label_energy(self.neg_h, self.neg_l))
-        chans['energy'] = energy
-        chans['label_energy'] = label_energy
-
         return chans
 
 
@@ -809,4 +845,7 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
         x = dataset.get_batch_design(10000, include_labels=False)
         ml_vbias = rbm_utils.compute_ml_bias(x)
         model.vbias.set_value(ml_vbias)
+        pval_v = sigm(model.vbias.get_value())
+        neg_v = model.rng.binomial(n=1, p=pval_v, size=(model.batch_size, model.n_v))
+        model.neg_v.set_value(neg_v)
         super(TrainingAlgorithm, self).setup(model, dataset)
