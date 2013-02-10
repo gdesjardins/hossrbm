@@ -68,7 +68,7 @@ class PooledSpikeSlabRBM(Model, Block):
         flags.setdefault('use_cd', False)
         flags.setdefault('use_energy', False)
         flags.setdefault('wv_norm', None)
-        flags.setdefault('truncated_normal', False)
+        flags.setdefault('truncate_v', False)
         flags.setdefault('lambd_interaction', False)
         flags.setdefault('scalar_lambd', False)
         flags.setdefault('ml_lambd', False)
@@ -295,7 +295,7 @@ class PooledSpikeSlabRBM(Model, Block):
     def train_batch(self, dataset, batch_size):
 
         x = dataset.get_batch_design(batch_size, include_labels=False)
-        if self.flags['truncated_normal']:
+        if self.flags['truncate_v']:
             x = numpy.clip(x, -self.truncation_bound['v'], self.truncation_bound['v'])
         self.batch_train_func(x)
 
@@ -428,7 +428,7 @@ class PooledSpikeSlabRBM(Model, Block):
         v_mean = self.v_given_hs(h_sample, s_sample)
 
         rng = self.theano_rng if rng is None else rng
-        if self.flags['truncated_normal']:
+        if self.flags['truncate_v']:
             v_sample = truncated.truncated_normal(
                     size=(self.batch_size, self.n_v),
                     avg = v_mean, 
@@ -599,7 +599,7 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
         if model.flags['ml_lambd']:
             # compute maximum likelihood solution for lambd
             x = dataset.get_batch_design(10000, include_labels=False)
-            scale = (1./numpy.std(x, axis=0))**2
+            scale = 1./numpy.std(x, axis=0)**2
             model.lambd.set_value(softplus_inv(scale).astype(floatX))
             # reset neg_v markov chain accordingly
             neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
