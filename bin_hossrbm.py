@@ -29,6 +29,8 @@ from utils import rbm_utils
 from utils import sharedX, floatX, npy_floatX
 from true_gradient import true_gradient
 
+def sigm(x): return 1./(1 + numpy.exp(-x))
+def softplus(x): return numpy.log(1. + numpy.exp(x))
 
 class BinaryBilinearSpikeSlabRBM(Model, Block):
     """Spike & Slab Restricted Boltzmann Machine (RBM)  """
@@ -246,14 +248,16 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
         # initialize binary g-h chains
-        neg_g = self.rng.binomial(n=1, p=self.gbias.get_value(), size=(self.batch_size, self.n_g))
-        neg_h = self.rng.binomial(n=1, p=self.hbias.get_value(), size=(self.batch_size, self.n_h))
-        neg_v = self.rng.binomial(n=1, p=self.vbias.get_value(), size=(self.batch_size, self.n_v))
+        pval_g = sigm(self.gbias.get_value())
+        pval_h = sigm(self.hbias.get_value())
+        pval_v = sigm(self.vbias.get_value())
+        neg_g = self.rng.binomial(n=1, p=pval_g, size=(self.batch_size, self.n_g))
+        neg_h = self.rng.binomial(n=1, p=pval_h, size=(self.batch_size, self.n_h))
+        neg_v = self.rng.binomial(n=1, p=pval_v, size=(self.batch_size, self.n_v))
         self.neg_g  = sharedX(neg_g, name='neg_g')
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_v  = sharedX(neg_v, name='neg_v')
         # initialize s-chain
-        def softplus(x): return numpy.log(1. + numpy.exp(x))
         loc = self.mu.get_value()
         scale = numpy.sqrt(1./softplus(self.alpha.get_value()))
         neg_s  = self.rng.normal(loc=loc, scale=scale, size=(self.batch_size, self.n_s))
@@ -792,5 +796,7 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
         x = dataset.get_batch_design(10000, include_labels=False)
         ml_vbias = rbm_utils.compute_ml_bias(x)
         model.vbias.set_value(ml_vbias)
-        neg_v = model.rng.binomial(n=1, p=model.vbias.get_value(), size=(model.batch_size, model.n_v))
+        pval_v = sigm(model.vbias.get_value())
+        neg_v = model.rng.binomial(n=1, p=pval_v, size=(model.batch_size, model.n_v))
+        model.neg_v.set_value(neg_v.astype(floatX))
         super(TrainingAlgorithm, self).setup(model, dataset)
