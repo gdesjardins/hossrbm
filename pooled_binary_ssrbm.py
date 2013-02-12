@@ -402,7 +402,7 @@ class PooledBinarySpikeSlabRBM(Model, Block):
         Wv = self.scalar_norms * self.Wv
         from_h = self.from_h(h_sample)
         v_mean = T.dot(s_sample * from_h, Wv.T) + self.vbias
-        return v_mean
+        return T.nnet.sigmoid(v_mean)
 
     def sample_v_given_hs(self, h_sample, s_sample, rng=None):
         v_mean = self.v_given_hs(h_sample, s_sample)
