@@ -595,7 +595,7 @@ class BinaryBilinearSpikeSlabRBMWithLabels(Model, Block):
         from_g = self.from_g(g_sample)
         from_h = self.from_h(h_sample)
         v_mean = T.dot(s_sample * from_g * from_h, Wv.T) + self.vbias
-        return v_mean
+        return T.nnet.sigmoid(v_mean)
 
     def sample_v_given_ghs(self, g_sample, h_sample, s_sample, rng=None, size=None):
         v_mean = self.v_given_ghs(g_sample, h_sample, s_sample)
