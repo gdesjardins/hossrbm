@@ -23,7 +23,6 @@ from pylearn2.models.model import Model
 from pylearn2.space import VectorSpace
 
 from utils import tools
-from utils import rbm_utils
 from hossrbm import costmod
 from utils import sharedX, floatX, npy_floatX
 
