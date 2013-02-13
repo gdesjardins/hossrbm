@@ -12,9 +12,11 @@ dataset =\
     !obj:pylearn2.datasets.mnist_variations.MNIST_variations {{
         "which_set": {which_set},
         "variation": {variation},
-        "center": 1,
+        "center": {center},
         "shuffle": 1,
         "one_hot": 1,
+        "gcn": {gcn},
+        "standardize_pixels": {standardize_pixels},
     }}
     """
 
