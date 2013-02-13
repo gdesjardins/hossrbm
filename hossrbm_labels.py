@@ -16,6 +16,7 @@ from theano.printing import Print
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from theano import function, shared
 from theano.sandbox import linalg
+from theano.ifelse import ifelse
 
 from pylearn2.training_algorithms import default
 from pylearn2.utils import serial
@@ -238,6 +239,9 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_g  = sharedX(neg_g, name='neg_g')
         self.neg_l  = sharedX(neg_l, name='neg_l')
+        # other misc.
+        self.pos_counter  = sharedX(0., name='pos_counter')
+        self.odd_even = sharedX(0., name='odd_even')
  
     def params(self):
         """
@@ -424,7 +428,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
         init_state['l'] = T.ones((v.shape[0],self.n_l)) * T.nnet.softmax(self.lbias)
-        [g, h, l] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
+        [g, h, l, pos_counter] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
         s = self.s_given_ghv(g, h, v)
 
         atoms = {
@@ -478,10 +482,10 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         return T.dot(h_sample, self.Wh)
 
     def to_g(self, g_s):
-        return T.dot(g_s, self.Wg.T) + self.gbias
+        return T.dot(g_s, self.Wg.T)
 
     def to_h(self, h_s):
-        return T.dot(h_s, self.Wh.T) + self.hbias
+        return T.dot(h_s, self.Wh.T)
 
     def l_given_h(self, h_sample):
         """
@@ -512,7 +516,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         from_g = self.from_g(g_sample)
         h_mean_s = 0.5 * 1./self.alpha_prec * from_g * from_v**2
         h_mean_s += from_g * from_v * self.mu
-        h_mean = self.to_h(h_mean_s)
+        h_mean = self.to_h(h_mean_s) + self.hbias
         h_mean += self.label_multiplier * T.dot(l_sample, self.Whl.T)
         return h_mean
     
@@ -542,7 +546,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         from_h = self.from_h(h_sample)
         g_mean_s = 0.5 * 1./self.alpha_prec * from_h * from_v**2
         g_mean_s += from_h * from_v * self.mu
-        g_mean = self.to_g(g_mean_s)
+        g_mean = self.to_g(g_mean_s) + self.gbias
         return g_mean
     
     def g_given_hv(self, h_sample, v_sample):
@@ -643,24 +647,50 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         """
         assert mean_field
 
-        def pos_mf_iteration(g1, h1, l1, v, size):
-            l2 = self.l_given_h(h1)
-            h2 = self.h_given_gvl(g1, v, l2)
-            g2 = self.g_given_hv(h2, v)
-            return [g2, h2, l2], theano.scan_module.until(
-                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
+        def pos_mf_iteration(g1, h1, l1, pos_counter, v, size):
+            # branch1: start with g
+            branch1_g2 = self.g_given_hv(h1, v)
+            branch1_h2 = self.h_given_gvl(branch1_g2, v, l1)
+            branch1_l2 = self.l_given_h(branch1_h2)
+            # branch2: start with h
+            branch2_h2 = self.h_given_gvl(g1, v, l1)
+            branch2_l2 = self.l_given_h(branch2_h2)
+            branch2_g2 = self.g_given_hv(branch2_h2, v)
+            # decide which way we should sample
+            g2 = ifelse(self.odd_even, branch1_g2, branch2_g2)
+            h2 = ifelse(self.odd_even, branch1_h2, branch2_h2)
+            l2 = ifelse(self.odd_even, branch1_l2, branch2_l2)
+            # stopping criterion
+            dl_dghat = T.max(abs(self.dfe_dghat(g2, h2, l2, v)))
+            dl_dhhat = T.max(abs(self.dfe_dhhat(g2, h2, l2, v)))
+            dl_dlhat = T.max(abs(self.dfe_dlhat(g2, h2, l2, v)))
+            stop = T.max((dl_dghat, dl_dhhat, dl_dlhat))
+            return [g2, h2, l2, pos_counter + 1], theano.scan_module.until(stop < eps)
 
-        def pos_mf_iteration_labels(g1, h1, v, l, size):
-            h2 = self.h_given_gvl(g1, v, l)
-            g2 = self.g_given_hv(h2, v)
-            return [g2, h2], theano.scan_module.until(
-                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
+        def pos_mf_iteration_labels(g1, h1, pos_counter, v, l, size):
+            # branch1: start with g
+            branch1_g2 = self.g_given_hv(h1, v)
+            branch1_h2 = self.h_given_gvl(branch1_g2, v, l)
+            # branch2: start with h
+            branch2_h2 = self.h_given_gvl(g1, v, l)
+            branch2_g2 = self.g_given_hv(branch2_h2, v)
+            # decide which way we should sample
+            g2 = ifelse(self.odd_even, branch1_g2, branch2_g2)
+            h2 = ifelse(self.odd_even, branch1_h2, branch2_h2)
+            # stopping criterion
+            dl_dghat = T.max(abs(self.dfe_dghat(g2, h2, l, v)))
+            dl_dhhat = T.max(abs(self.dfe_dhhat(g2, h2, l, v)))
+            stop = T.max((dl_dghat, dl_dhhat))
+            return [g2, h2, pos_counter + 1], theano.scan_module.until(stop < eps)
 
         iter_func = pos_mf_iteration if l is None else pos_mf_iteration_labels
         non_sequences = [v, v.shape[0]] if l is None else [v, l, v.shape[0]]
+
+        # define initial conditions for loop
         outputs_info = [init_state['g'], init_state['h']]
         if l is None:
             outputs_info += [init_state['l']]
+        outputs_info += [0.]
 
         outputs, updates = theano.scan(
                 iter_func,
@@ -700,6 +730,8 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
 
         # update running average of positive phase activations
         pos_updates = OrderedDict()
+        pos_updates[self.pos_counter] = outputs[-1]
+        pos_updates[self.odd_even] = (self.odd_even + 1) % 2
         return pos_states, pos_updates
 
     def neg_sampling(self, g_sample, h_sample, v_sample, l_sample, n_steps=1):
@@ -713,9 +745,9 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         """
 
         def gibbs_iteration(g1, h1, v1, l1):
-            l2 = self.sample_l_given_h(h1)
-            h2 = self.sample_h_given_gvl(g1, v1, l2)
-            g2 = self.sample_g_given_hv(h2, v1)
+            g2 = self.sample_g_given_hv(h1, v1)
+            h2 = self.sample_h_given_gvl(g2, v1, l1)
+            l2 = self.sample_l_given_h(h2)
             s2 = self.sample_s_given_ghv(g2, h2, v1)
             v2 = self.sample_v_given_ghs(g2, h2, s2)
             return [g2, h2, s2, v2, l2]
@@ -726,9 +758,9 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
                 n_steps=n_steps)
 
         final_v = new_v[-1]
-        final_l = self.sample_l_given_h(new_h[-1])
-        final_h = self.sample_h_given_gvl(new_g[-1], final_v, final_l)
-        final_g = self.sample_g_given_hv(final_h, final_v)
+        final_g = self.sample_g_given_hv(new_h[-1], final_v)
+        final_h = self.sample_h_given_gvl(final_g, final_v, new_l[-1])
+        final_l = self.sample_l_given_h(final_h)
         final_s = self.sample_s_given_ghv(final_g, final_h, final_v)
 
         return [final_g, final_h, final_s, final_v, final_l]
@@ -837,6 +869,30 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
                 name + '.max':  b.max(),
                 name + '.absmean': abs(b).mean()}
 
+    def dfe_dghat(self, g_hat, h_hat, l_hat, v):
+        from_v = self.from_v(v)
+        from_h = self.from_h(h_hat)
+        rval = self.gbias
+        rval += self.to_g(0.5 * 1./self.alpha_prec * from_h * from_v**2)
+        rval += self.to_g(self.mu * from_h * from_v)
+        dentropy = - (1 - g_hat) * T.xlogx.xlogx(g_hat) + g_hat * T.xlogx.xlogx(1 - g_hat)
+        return g_hat * (1-g_hat) * rval  + dentropy
+
+    def dfe_dhhat(self, g_hat, h_hat, l_hat, v):
+        from_v = self.from_v(v)
+        from_g = self.from_g(g_hat)
+        rval = self.hbias
+        rval += self.to_h(0.5 * 1./self.alpha_prec * from_g * from_v**2)
+        rval += self.to_h(self.mu * from_g * from_v)
+        rval += self.label_multiplier * T.dot(l_hat, self.Whl.T)
+        dentropy = - (1 - h_hat) * T.xlogx.xlogx(h_hat) + h_hat * T.xlogx.xlogx(1 - h_hat)
+        return h_hat * (1-h_hat) * rval  + dentropy
+
+    def dfe_dlhat(self, g_hat, h_hat, l_hat, v):
+        rval = self.label_multiplier * (T.dot(h_hat, self.Whl) + self.lbias)
+        dentropy = - (1 - l_hat) * T.xlogx.xlogx(l_hat) + l_hat * T.xlogx.xlogx(1 - l_hat)
+        return l_hat * (1- l_hat) * rval  + dentropy
+
     def get_monitoring_channels(self, x, y=None):
         chans = OrderedDict()
         if self.flags['split_norm']:
@@ -870,6 +926,19 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         label_fe = T.mean(self.label_energy(self.neg_h, self.neg_l))
         chans['energy'] = fe
         chans['label_energy'] = label_fe
+
+        ### MONITOR MEAN-FIELD CONVERGENCE ###
+        pos_states, pos_updates = self.pos_phase_updates(x,
+                n_steps = self.pos_steps,
+                mean_field=self.flags['mean_field'])
+        dfe_dghat = abs(self.dfe_dghat(pos_states['g'], pos_states['h'], pos_states['l'], x))
+        dfe_dhhat = abs(self.dfe_dhhat(pos_states['g'], pos_states['h'], pos_states['l'], x))
+        dfe_dlhat = abs(self.dfe_dlhat(pos_states['g'], pos_states['h'], pos_states['l'], x))
+        chans.update(self.monitor_vector(dfe_dghat, name='abs_dfe_dghat'))
+        chans.update(self.monitor_vector(dfe_dhhat, name='abs_dfe_dhhat'))
+        chans.update(self.monitor_vector(dfe_dlhat, name='abs_dfe_dlhat'))
+        chans['pos_counter'] = self.pos_counter
+ 
         return chans
 
 
