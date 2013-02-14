@@ -16,6 +16,7 @@ from theano.printing import Print
 from theano.sandbox.rng_mrg import MRG_RandomStreams as RandomStreams
 from theano import function, shared
 from theano.sandbox import linalg
+from theano.ifelse import ifelse
 
 from pylearn2.training_algorithms import default
 from pylearn2.utils import serial
@@ -262,6 +263,9 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         scale = numpy.sqrt(1./softplus(self.alpha.get_value()))
         neg_s  = self.rng.normal(loc=loc, scale=scale, size=(self.batch_size, self.n_s))
         self.neg_s  = sharedX(neg_s, name='neg_s')
+        # other misc.
+        self.pos_counter  = sharedX(0., name='pos_counter')
+        self.odd_even = sharedX(0., name='odd_even')
  
     def params(self):
         """
@@ -278,6 +282,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         init_names = dir(self)
 
         ###### All fields you don't want to get pickled (e.g., theano functions) should be created below this line
+
         # SAMPLING: NEGATIVE PHASE
         neg_updates = self.neg_sampling_updates(n_steps=self.neg_sample_steps, use_pcd=True)
         self.sample_func = theano.function([], [], updates=neg_updates)
@@ -287,6 +292,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
                 self.input,
                 n_steps = self.pos_steps,
                 mean_field=self.flags['mean_field'])
+        self.inference_func = theano.function([self.input], [pos_states['g'], pos_states['h']])
 
         ##
         # BUILD COST OBJECTS
@@ -427,7 +433,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
+        [g, h, pos_counter] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
 
         atoms = {
                 'g_s' : T.dot(g, self.Wg),  # g in s-space
@@ -464,10 +470,10 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         return T.dot(h_sample, self.Wh)
 
     def to_g(self, g_s):
-        return T.dot(g_s, self.Wg.T) + self.gbias
+        return T.dot(g_s, self.Wg.T)
 
     def to_h(self, h_s):
-        return T.dot(h_s, self.Wh.T) + self.hbias
+        return T.dot(h_s, self.Wh.T)
 
     def h_given_gv_input(self, g_sample, v_sample):
         """
@@ -479,7 +485,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         from_g = self.from_g(g_sample)
         h_mean_s = 0.5 * 1./self.alpha_prec * from_g * from_v**2
         h_mean_s += from_g * from_v * self.mu
-        h_mean = self.to_h(h_mean_s)
+        h_mean = self.to_h(h_mean_s) + self.hbias
         return h_mean
     
     def h_given_gv(self, g_sample, v_sample):
@@ -508,7 +514,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         from_h = self.from_h(h_sample)
         g_mean_s = 0.5 * 1./self.alpha_prec * from_h * from_v**2
         g_mean_s += from_h * from_v * self.mu
-        g_mean = self.to_g(g_mean_s)
+        g_mean = self.to_g(g_mean_s) + self.gbias
         return g_mean
     
     def g_given_hv(self, h_sample, v_sample):
@@ -580,28 +586,38 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         :param init: dictionary of initial values
         :param n_steps: number of Gibbs updates to perform afterwards.
         """
-
-        def pos_gibbs_iteration(g1, h1, v, size):
+        def pos_gibbs_iteration(g1, h1, pos_counter, v, size):
             g2 = self.sample_g_given_hv(h1, v, size=size)
             h2 = self.sample_h_given_gv(g2, v, size=size)
-            return [g2, h2]
+            return [g2, h2, pos_counter + 1]
 
-        def pos_mf_iteration(g1, h1, v, size):
-            g2 = self.g_given_hv(h1, v)
-            h2 = self.h_given_gv(g2, v)
-            return [g2, h2], theano.scan_module.until(
-                    (0.5 * (abs(g2 - g1).mean() + abs(h2-h1).mean()) < eps))
+        def pos_mf_iteration(g1, h1, pos_counter, v, size):
+            # branch1: start with g
+            branch1_g2 = self.g_given_hv(h1, v)
+            branch1_h2 = self.h_given_gv(branch1_g2, v)
+            # branch2: start with g
+            branch2_h2 = self.h_given_gv(g1, v)
+            branch2_g2 = self.g_given_hv(branch2_h2, v)
+            # decide which way we should sample
+            g2 = ifelse(self.odd_even, branch1_g2, branch2_g2)
+            h2 = ifelse(self.odd_even, branch1_h2, branch2_h2)
+            # stopping criterion
+            dl_dghat = T.max(abs(self.dfe_dghat(g2, h2, v)))
+            dl_dhhat = T.max(abs(self.dfe_dhhat(g2, h2, v)))
+            stop = T.maximum(dl_dghat, dl_dhhat)
+            return [g2, h2, pos_counter + 1], theano.scan_module.until(stop < eps)
 
-        [new_g, new_h], updates = theano.scan(
+        [new_g, new_h, pos_counter], updates = theano.scan(
                 pos_mf_iteration if mean_field else pos_gibbs_iteration,
-                outputs_info = [init_state['g'], init_state['h']],
+                outputs_info = [init_state['g'], init_state['h'], 0.],
                 non_sequences = [v, v.shape[0]],
                 n_steps=n_steps)
 
         new_g = new_g[-1]
         new_h = new_h[-1]
+        new_pos_counter = pos_counter[-1]
 
-        return [new_g, new_h]
+        return [new_g, new_h, new_pos_counter]
 
     def pos_phase_updates(self, v, init_state=None, n_steps=1, mean_field=False):
         """
@@ -619,7 +635,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
             init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
             init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
 
-        [new_g, new_h] = self.pos_phase(v,
+        [new_g, new_h, pos_counter] = self.pos_phase(v,
                 init_state=init_state,
                 n_steps=n_steps,
                 mean_field=mean_field)
@@ -630,6 +646,8 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
 
         # update running average of positive phase activations
         pos_updates = OrderedDict()
+        pos_updates[self.pos_counter] = pos_counter
+        pos_updates[self.odd_even] = (self.odd_even + 1) % 2
         return pos_states, pos_updates
 
     def neg_sampling(self, g_sample, h_sample, v_sample, n_steps=1):
@@ -764,6 +782,24 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
                 name + '.max':  b.max(),
                 name + '.absmean': abs(b).mean()}
 
+    def dfe_dghat(self, g_hat, h_hat, v):
+        from_v = self.from_v(v)
+        from_h = self.from_h(h_hat)
+        rval = self.gbias
+        rval += self.to_g(0.5 * 1./self.alpha_prec * from_h * from_v**2)
+        rval += self.to_g(self.mu * from_h * from_v)
+        dentropy = - (1 - g_hat) * T.xlogx.xlogx(g_hat) + g_hat * T.xlogx.xlogx(1 - g_hat)
+        return g_hat * (1-g_hat) * rval  + dentropy
+
+    def dfe_dhhat(self, g_hat, h_hat, v):
+        from_v = self.from_v(v)
+        from_g = self.from_g(g_hat)
+        rval = self.hbias
+        rval += self.to_h(0.5 * 1./self.alpha_prec * from_g * from_v**2)
+        rval += self.to_h(self.mu * from_g * from_v)
+        dentropy = - (1 - h_hat) * T.xlogx.xlogx(h_hat) + h_hat * T.xlogx.xlogx(1 - h_hat)
+        return h_hat * (1-h_hat) * rval  + dentropy
+
     def get_monitoring_channels(self, x, y=None):
         chans = OrderedDict()
         if self.flags['split_norm']:
@@ -787,6 +823,15 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_vector(wh_norm, name='wh_norm'))
         chans.update(self.monitor_vector(wv_norm, name='wv_norm'))
         chans['lr'] = self.lr
+        ### MONITOR MEAN-FIELD CONVERGENCE ###
+        pos_states, pos_updates = self.pos_phase_updates(x,
+                n_steps = self.pos_steps,
+                mean_field=self.flags['mean_field'])
+        dfe_dghat = abs(self.dfe_dghat(pos_states['g'], pos_states['h'], x))
+        dfe_dhhat = abs(self.dfe_dhhat(pos_states['g'], pos_states['h'], x))
+        chans.update(self.monitor_vector(dfe_dghat, name='abs_dfe_dghat'))
+        chans.update(self.monitor_vector(dfe_dhhat, name='abs_dfe_dhhat'))
+        chans['pos_counter'] = self.pos_counter
         return chans
 
 
