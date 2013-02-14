@@ -492,7 +492,7 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         Compute p(l_i = 1 | h)
         :param h_sample: T.matrix of shape (batch_size, n_l matrix)
         """
-        l_mean = T.dot(h_sample, self.Whl) + self.lbias
+        l_mean = self.label_multiplier * (T.dot(h_sample, self.Whl) + self.lbias)
         return T.nnet.softmax(l_mean)
  
     def sample_l_given_h(self, h_sample, rng=None, size=None):
@@ -889,9 +889,14 @@ class BilinearSpikeSlabRBMWithLabels(Model, Block):
         return h_hat * (1-h_hat) * rval  + dentropy
 
     def dfe_dlhat(self, g_hat, h_hat, l_hat, v):
-        rval = self.label_multiplier * (T.dot(h_hat, self.Whl) + self.lbias)
-        dentropy = - (1 - l_hat) * T.xlogx.xlogx(l_hat) + l_hat * T.xlogx.xlogx(1 - l_hat)
-        return l_hat * (1- l_hat) * rval  + dentropy
+        # term from loss function
+        dloss_dl = self.label_multiplier * (T.dot(h_hat, self.Whl) + self.lbias)
+        rval = dloss_dl * l_hat - l_hat * T.shape_padright(T.sum(l_hat * dloss_dl, axis=1))
+        # term from entropy.
+        # dentropy = T.sum(-l_hat * T.log(l_hat), axis=1)
+        dentropy = - T.xlogx.xlogx(l_hat) - l_hat +\
+                     l_hat * T.shape_padright(T.sum(T.xlogx.xlogx(l_hat) + l_hat, axis=1))
+        return rval + dentropy
 
     def get_monitoring_channels(self, x, y=None):
         chans = OrderedDict()
