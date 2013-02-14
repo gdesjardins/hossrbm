@@ -229,6 +229,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_h = self.rng.binomial(n=1, p=pval_h, size=(self.batch_size, self.n_h))
         self.neg_h  = sharedX(neg_h, name='neg_h')
         self.neg_g  = sharedX(neg_g, name='neg_g')
+        # other misc.
         self.pos_counter  = sharedX(0., name='pos_counter')
         self.odd_even = sharedX(0., name='odd_even')
  
@@ -445,7 +446,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
+        [g, h, pos_counter] = self.pos_phase(v, init_state, n_steps=self.pos_steps, mean_field=mean_field)
         s = self.s_given_ghv(g, h, v)
 
         atoms = {
