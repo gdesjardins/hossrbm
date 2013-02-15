@@ -75,7 +75,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('split_norm', False)
         flags.setdefault('mean_field', False)
         flags.setdefault('ml_lambd', False)
-        if len(flags.keys()) != 10:
+        flags.setdefault('init_mf_rand', False)
+        if len(flags.keys()) != 11:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
@@ -213,6 +214,9 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
+        # initialize buffers to store inference state
+        self.pos_g  = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_g')
+        self.pos_h  = sharedX(numpy.zeros((self.batch_size, self.n_h)), name='pos_h')
         # initialize visible unit chains
         scale = numpy.sqrt(1./softplus(self.lambd.get_value()))
         neg_v  = self.rng.normal(loc=0, scale=scale, size=(self.batch_size, self.n_v))
@@ -302,6 +306,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.batch_train_func = function([self.input], [],
                                          updates=learning_updates,
                                          name='train_rbm_func')
+        #theano.printing.pydotprint(self.batch_train_func, outfile='batch_train_func.png', scan_graphs=True);
 
         #######################
         # CONSTRAINT FUNCTION #
@@ -337,10 +342,12 @@ class BilinearSpikeSlabRBM(Model, Block):
             elif self.flags['wh_norm'] == 'max_unit':
                 constraint_updates[self.Wh] = self.Wh / norm_wh * T.minimum(norm_wh, 1.0)
 
+        norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
         if self.flags['wv_norm'] == 'max_unit':
-            norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
             constraint_updates[self.Wv] = self.Wv / norm_wv * T.minimum(norm_wv, 1.0)
             constraint_updates[self.scalar_norms] = T.maximum(1.0, self.scalar_norms)
+        elif self.flags['wv_norm'] == 'max_mean':
+            constraint_updates[self.Wv] = self.Wv / norm_wv * T.mean(norm_wv)
 
         ## clip parameters to maximum values (if applicable)
         for (k,v) in self.clip_max.iteritems():
@@ -689,8 +696,12 @@ class BilinearSpikeSlabRBM(Model, Block):
             assert n_steps
             # start sampler from scratch
             init_state = OrderedDict()
-            init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
-            init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
+            if self.flags['init_mf_rand']:
+                init_state['g'] = 0.5 * T.ones((self.batch_size,self.n_g))
+                init_state['h'] = 0.5 * T.ones((self.batch_size,self.n_h))
+            else:
+                init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
+                init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
 
         [new_g, new_h, pos_counter] = self.pos_phase(v,
                 init_state=init_state,
@@ -705,6 +716,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         pos_updates = OrderedDict()
         pos_updates[self.pos_counter] = pos_counter
         pos_updates[self.odd_even] = (self.odd_even + 1) % 2
+        pos_updates[self.pos_g] = new_g
+        pos_updates[self.pos_h] = new_h
         return pos_states, pos_updates
 
     def neg_sampling(self, g_sample, h_sample, v_sample, n_steps=1):
@@ -869,6 +882,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_vector(self.alpha_prec, name='alpha_prec'))
         chans.update(self.monitor_vector(self.mu))
         chans.update(self.monitor_vector(self.lambd_prec, name='lambd_prec'))
+        chans.update(self.monitor_matrix(self.pos_g))
+        chans.update(self.monitor_matrix(self.pos_h))
         chans.update(self.monitor_matrix(self.neg_g))
         chans.update(self.monitor_matrix(self.neg_h))
         chans.update(self.monitor_matrix(self.neg_s - self.mu, name='(neg_s - mu)'))
