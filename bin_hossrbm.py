@@ -69,7 +69,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('split_norm', False)
         flags.setdefault('mean_field', False)
         flags.setdefault('init_mf_rand', False)
-        if len(flags.keys()) != 5:
+        if len(flags.keys()) != 6:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     @classmethod
@@ -369,8 +369,8 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
             elif self.flags['wh_norm'] == 'max_unit':
                 constraint_updates[self.Wh] = self.Wh / norm_wh * T.minimum(norm_wh, 1.0)
 
+        norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
         if self.flags['wv_norm'] == 'max_unit':
-            norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
             constraint_updates[self.Wv] = self.Wv / norm_wv * T.minimum(norm_wv, 1.0)
             constraint_updates[self.scalar_norms] = T.maximum(1.0, self.scalar_norms)
         elif self.flags['wv_norm'] == 'max_mean':
