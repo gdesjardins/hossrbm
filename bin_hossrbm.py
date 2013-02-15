@@ -68,6 +68,7 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('wv_norm', 'none')
         flags.setdefault('split_norm', False)
         flags.setdefault('mean_field', False)
+        flags.setdefault('init_mf_rand', False)
         if len(flags.keys()) != 5:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
@@ -372,6 +373,8 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
             norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
             constraint_updates[self.Wv] = self.Wv / norm_wv * T.minimum(norm_wv, 1.0)
             constraint_updates[self.scalar_norms] = T.maximum(1.0, self.scalar_norms)
+        elif self.flags['wv_norm'] == 'max_mean':
+            constraint_updates[self.Wv] = self.Wv / norm_wv * T.mean(norm_wv)
 
         ## clip parameters to maximum values (if applicable)
         for (k,v) in self.clip_max.iteritems():
@@ -632,8 +635,12 @@ class BinaryBilinearSpikeSlabRBM(Model, Block):
             assert n_steps
             # start sampler from scratch
             init_state = OrderedDict()
-            init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
-            init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
+            if self.flags['init_mf_rand']:
+                init_state['g'] = 0.5 * T.ones((self.batch_size,self.n_g))
+                init_state['h'] = 0.5 * T.ones((self.batch_size,self.n_h))
+            else:
+                init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
+                init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
 
         [new_g, new_h, pos_counter] = self.pos_phase(v,
                 init_state=init_state,
