@@ -35,14 +35,16 @@ class GaussianRBM(Model, Block):
 
     def validate_flags(self, flags):
         flags.setdefault('scalar_lambd', False)
-        if len(flags.keys()) != 1:
+        flags.setdefault('natdiag', False)
+        flags.setdefault('unit_std', False)
+        if len(flags.keys()) != 3:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
             numpy_rng = None, theano_rng = None,
             n_h=99, n_v=100, init_from=None, neg_sample_steps=1,
             lr_spec=None, lr_timestamp=None, lr_mults = {},
-            iscales={}, clip_min={}, clip_max={},
+            iscales={}, clip_min={}, clip_max={}, natural_params={},
             l1 = {}, l2 = {},
             sp_weight={}, sp_targ={},
             batch_size = 13,
@@ -133,22 +135,24 @@ class GaussianRBM(Model, Block):
     def init_parameters(self):
         # init weight matrices
         self.Wv = self.init_weight(self.iscales.get('Wv', 1.0), (self.n_v, self.n_h), 'Wv', normalize=False)
+        self.nat_wv = sharedX(numpy.zeros((self.n_v, self.n_h)), name='nat_wv')
         # allocate shared variables for bias parameters
+        self.vbias = sharedX(self.iscales['vbias'] * numpy.ones(self.n_v), name='vbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
         # diagonal of precision matrix of visible units
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
-        self.lambd_prec = T.nnet.softplus(self.lambd)
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
         self.neg_v  = sharedX(self.rng.rand(self.batch_size, self.n_v), name='neg_v')
         self.neg_h  = sharedX(self.rng.rand(self.batch_size, self.n_h), name='neg_h')
+        self.avg_hact_std = sharedX(numpy.ones(self.n_h), name='avg_hact_std')
  
     def params(self):
         """
         Returns a list of learnt model parameters.
         """
-        params = [self.Wv, self.hbias]
+        params = [self.Wv, self.hbias, self.vbias]
         return params
 
     def do_theano(self):
@@ -164,14 +168,17 @@ class GaussianRBM(Model, Block):
         ##
         # BUILD COST OBJECTS
         ##
-        lcost = self.ml_cost(pos_v = self.input, neg_v = neg_updates[self.neg_v])
+        mlcost = self.ml_cost(pos_v = self.input, neg_v = neg_updates[self.neg_v])
+        mlcost.compute_gradients(self.lr, self.lr_mults)
+        nat_updates = self.get_natural_diag_direction(mlcost, v_sample=neg_updates[self.neg_v])
+
         spcost = self.get_sparsity_cost()
         regcost = self.get_reg_cost(self.l2, self.l1)
 
         ##
         # COMPUTE GRADIENTS WRT. COSTS
         ##
-        main_cost = [lcost, spcost, regcost]
+        main_cost = [mlcost, spcost, regcost]
         learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
 
         ##
@@ -179,6 +186,7 @@ class GaussianRBM(Model, Block):
         ##
         learning_updates = costmod.get_updates(learning_grads)
         learning_updates.update(neg_updates)
+        learning_updates.update(nat_updates)
         learning_updates.update({self.iter: self.iter+1})
 
         # build theano function to train on a single minibatch
@@ -191,24 +199,7 @@ class GaussianRBM(Model, Block):
         #######################
 
         # enforce constraints function
-        constraint_updates = OrderedDict() 
-
-        ## clip parameters to maximum values (if applicable)
-        for (k,v) in self.clip_max.iteritems():
-            assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
-            constraint_updates[param] = T.clip(param, param, v)
-
-        ## clip parameters to minimum values (if applicable)
-        for (k,v) in self.clip_min.iteritems():
-            assert k in [param.name for param in self.params()]
-            param = getattr(self, k)
-            constraint_updates[param] = T.clip(constraint_updates.get(param, param), v, param)
-        
-        ## constrain lambd to be a scalar
-        if self.flags['scalar_lambd']:
-            lambd = constraint_updates.get(self.lambd, self.lambd)
-            constraint_updates[self.lambd] = T.mean(lambd) * T.ones_like(lambd)
+        constraint_updates = self.get_constraint_updates()
         self.enforce_constraints = theano.function([],[], updates=constraint_updates)
 
         ###### All fields you don't want to get pickled should be created above this line
@@ -218,11 +209,39 @@ class GaussianRBM(Model, Block):
         # Before we start learning, make sure constraints are enforced
         self.enforce_constraints()
 
+    def get_constraint_updates(self):
+        
+        updates = OrderedDict()
+
+        ## unit-variance constraint on hidden-unit activations ##
+        if self.flags['unit_std']:
+            updates[self.Wv] = self.Wv / self.avg_hact_std
+
+        ## clip parameters to maximum values (if applicable)
+        for (k,v) in self.clip_max.iteritems():
+            assert k in [param.name for param in self.params()]
+            param = getattr(self, k)
+            updates[param] = T.clip(param, param, v)
+
+        ## clip parameters to minimum values (if applicable)
+        for (k,v) in self.clip_min.iteritems():
+            assert k in [param.name for param in self.params()]
+            param = getattr(self, k)
+            updates[param] = T.clip(updates.get(param, param), v, param)
+        
+        ## constrain lambd to be a scalar
+        if self.flags['scalar_lambd']:
+            lambd = updates.get(self.lambd, self.lambd)
+            updates[self.lambd] = T.mean(lambd) * T.ones_like(lambd)
+
+        return updates
+ 
     def train_batch(self, dataset, batch_size):
 
         x = dataset.get_batch_design(batch_size, include_labels=False)
         self.batch_train_func(x)
-        self.enforce_constraints()
+        if self.batches_seen < 100000:
+            self.enforce_constraints()
 
         # accounting...
         self.examples_seen += self.batch_size
@@ -244,7 +263,7 @@ class GaussianRBM(Model, Block):
         Computes energy for a given configuration of (h,v)
         :param v_sample: T.matrix of shape (batch_size, n_v)
         """
-        fe = T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
+        fe = T.sum(0.5 * self.lambd * (v_sample - self.vbias)**2, axis=1)
         h_input = self.h_given_v_input(v_sample)
         fe -= T.sum(T.nnet.softplus(h_input), axis=1)
         return fe
@@ -257,7 +276,7 @@ class GaussianRBM(Model, Block):
     ######################################
 
     def h_given_v_input(self, v_sample):
-        return T.dot(self.lambd_prec * v_sample, self.Wv) + self.hbias
+        return T.dot(v_sample, self.Wv) + self.hbias
 
     def h_given_v(self, v_sample):
         h_mean = self.h_given_v_input(v_sample)
@@ -279,7 +298,7 @@ class GaussianRBM(Model, Block):
         Computes the mean-activation of visible units, given all other variables.
         :param h_sample: T.matrix of shape (batch_size, n_h)
         """
-        v_mean = T.dot(h_sample, self.Wv.T)
+        v_mean = 1./self.lambd * T.dot(h_sample, self.Wv.T) + self.vbias
         return v_mean
 
     def sample_v_given_h(self, h_sample, rng=None, size=None):
@@ -289,7 +308,7 @@ class GaussianRBM(Model, Block):
         v_sample = rng.normal(
                 size=(size, self.n_v),
                 avg = v_mean, 
-                std = T.sqrt(1./self.lambd_prec),
+                std = T.sqrt(1./self.lambd),
                 dtype=floatX)
         return v_sample
 
@@ -325,9 +344,11 @@ class GaussianRBM(Model, Block):
         [new_h, new_v] =  self.neg_sampling(
                 self.neg_h, self.neg_v, n_steps = n_steps)
 
+        new_h_act = self.h_given_v_input(self.neg_v)
         updates = OrderedDict()
         updates[self.neg_h] = new_h
         updates[self.neg_v] = new_v
+        updates[self.avg_hact_std] = 0.999 * self.avg_hact_std + 0.001 * T.std(new_h_act, axis=0)
         return updates
 
     def ml_cost(self, pos_v, neg_v):
@@ -337,6 +358,25 @@ class GaussianRBM(Model, Block):
         cost = batch_cost / self.batch_size
         # build gradient of cost with respect to model parameters
         return costmod.Cost(cost, self.params(), [pos_v, neg_v])
+
+    def get_natural_diag_direction(self, ml_cost, v_sample):
+        updates = OrderedDict()
+        if not self.flags['natdiag']:
+            return updates
+
+        # use different samples for mean vs. second-moment estimation
+        h_mean = self.h_given_v(v_sample)
+
+        # compute diagonal of Fisher information matrix
+        E_de_dw = 1./self.batch_size * T.dot(v_sample.T, h_mean)
+        E_squared_de_dw = 1./self.batch_size * T.dot(v_sample.T**2, h_mean**2)
+        Lww_diag = E_squared_de_dw - E_de_dw**2
+
+        # scale gradient on weights by inverse of variance
+        wv_scale = 1./ (Lww_diag + self.natural_params['damp'])
+        ml_cost.grads[self.Wv] *= wv_scale
+        updates[self.nat_wv] = wv_scale
+        return updates
 
     ##############################
     # GENERIC OPTIMIZATION STUFF #
@@ -399,10 +439,14 @@ class GaussianRBM(Model, Block):
     def get_monitoring_channels(self, x, y=None):
         chans = OrderedDict()
         chans.update(self.monitor_matrix(self.Wv))
+        chans.update(self.monitor_matrix(self.nat_wv))
+        chans.update(self.monitor_vector(self.vbias))
         chans.update(self.monitor_vector(self.hbias))
-        chans.update(self.monitor_vector(self.lambd_prec, name='lambd_prec'))
+        chans.update(self.monitor_vector(self.lambd, name='lambd'))
         chans.update(self.monitor_matrix(self.neg_h))
         chans.update(self.monitor_matrix(self.neg_v))
+        if self.flags['unit_std']:
+            chans.update(self.monitor_vector(self.avg_hact_std))
         wv_norm = T.sqrt(T.sum(self.Wv**2, axis=0))
         chans.update(self.monitor_vector(wv_norm, name='wv_norm'))
         chans['lr'] = self.lr
@@ -411,4 +455,6 @@ class GaussianRBM(Model, Block):
 class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
 
     def setup(self, model, dataset):
+        x = dataset.get_batch_design(10000, include_labels=False)
+        model.vbias.set_value(x.mean(axis=0))
         super(TrainingAlgorithm, self).setup(model, dataset)
