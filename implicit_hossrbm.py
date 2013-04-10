@@ -368,17 +368,19 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_v = self.from_v(v)
         from_h = self.from_h(h_hat)
         from_g = self.from_g(g_hat)
-        s_hat = self.s_hat(h_hat, s1_hat, s0_hat)
+        s_hat  = self.s_hat(h_hat, s1_hat, s0_hat)
+        ss_hat = self.s_hat(h_hat, s1_hat**2 + 1./self.alpha_prec,
+                                   s0_hat**2 + 1./self.alpha_prec)
 
         lq  = 0.
         lq += T.sum(from_v * s1_hat * from_h, axis=1)
-        lq -= 0.5 * T.sum(self.alpha_prec * s_hat**2 + 1., axis=1)
+        lq -= 0.5 * T.sum(self.alpha_prec * ss_hat, axis=1)
         lq -= T.sum(0.5 * self.lambd_prec * v**2, axis=1)
         lq += T.sum(self.alpha_prec * self.mu * s_hat, axis=1)
         lq += T.sum(self.alpha_prec * from_g  * s_hat, axis=1)
         lq += T.dot(g_hat, self.gbias)
         lq += T.dot(h_hat, self.hbias)
-        return T.mean(lq), [g_hat, h_hat, s_hat, s1_hat, s0_hat, v]
+        return T.mean(lq), [g_hat, h_hat, s_hat, ss_hat, s1_hat, s0_hat, v]
 
     def __call__(self, v, output_type='g+h'):
         print 'Building representation with %s' % output_type
@@ -694,7 +696,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         # - dlogZ/dtheta = E_p[ denergy / dtheta ]
         neg_cost, neg_cte = self.energy(neg_g, neg_h, neg_s, neg_v)
         # build gradient of cost with respect to model parameters
-        cost = pos_cost + neg_cost
+        cost = - (pos_cost + neg_cost)
         cte = pos_cte + neg_cte
         return costmod.Cost(cost, self.params(), cte)
 
