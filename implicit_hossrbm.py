@@ -52,7 +52,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('init_mf_rand', False)
         flags.setdefault('center_g', False)
         flags.setdefault('center_h', False)
-        if len(flags.keys()) != 12:
+        flags.setdefault('igo_init', False)
+        if len(flags.keys()) != 13:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def __init__(self, 
@@ -157,6 +158,12 @@ class BilinearSpikeSlabRBM(Model, Block):
         # init scalar norm for each entry of Wv
         sn_val = self.iscales['scalar_norms'] * numpy.ones(self.n_s)
         self.scalar_norms = sharedX(sn_val, name='scalar_norms')
+
+        if self.flags['igo_init']:
+            print 'Overriding iscales initialization with 1./sqrt(nv x nh)'
+            self.iscales['Wv'] = 1./numpy.sqrt(max(self.n_v, self.n_s))
+            self.iscales['Wg'] = 1./numpy.sqrt(max(self.n_g, self.n_s))
+            self.iscales['Wh'] = 1./numpy.sqrt(max(self.n_h, self.n_s))
 
         # init weight matrices
         self.Wv = self.init_weight(self.iscales['Wv'], (self.n_v, self.n_s), 'Wv')
@@ -365,7 +372,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         energy += 0.5 * T.sum(self.alpha_prec * s_sample**2, axis=1)
         energy += T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
         energy -= T.sum(self.alpha_prec * self.mu * s_sample, axis=1)
-        energy -= T.sum(self.alpha_prec * (s_sample - self.mu) * from_g, axis=1)
+        energy -= T.sum((s_sample - self.mu) * from_g, axis=1)
         energy -= T.dot(cg_sample, self.gbias)
         energy -= T.dot(ch_sample, self.hbias)
         return T.mean(energy), [g_sample, h_sample, s_sample, v_sample]
@@ -392,7 +399,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         lq -= 0.5 * T.sum(self.alpha_prec * ss_hat, axis=1)
         lq -= T.sum(0.5 * self.lambd_prec * v**2, axis=1)
         lq += T.sum(self.alpha_prec * self.mu * s_hat, axis=1)
-        lq += T.sum(self.alpha_prec * from_g  * (s_hat - self.mu), axis=1)
+        lq += T.sum(from_g  * (s_hat - self.mu), axis=1)
         lq += T.dot(cg_hat, self.gbias)
         lq += T.dot(ch_hat, self.hbias)
         return T.mean(lq), [g_hat, h_hat, s_hat, ss_hat, s1_hat, s0_hat, v]
@@ -402,8 +409,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         init_state = OrderedDict()
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
-        [g, h, pos_counter] = self.pos_phase(v, init_state, n_steps=self.pos_steps)
-        s = self.s_given_ghv(g, h, v)
+        [g, h, s2_1, s2_0, v, pos_counter] = self.pos_phase(v, init_state, n_steps=self.pos_steps)
+        s = s2_1
 
         atoms = {
             'g_s' : self.from_g(g),  # g in s-space
@@ -466,7 +473,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         return T.dot(h_s, self.Wh)
 
     def g_given_s(self, s_sample):
-        g_mean = self.to_g(self.alpha_prec * (s_sample - self.mu)) + self.gbias
+        g_mean = self.to_g((s_sample - self.mu)) + self.gbias
         return T.nnet.sigmoid(g_mean)
 
     def sample_g_given_s(self, s_sample, rng=None, size=None):
@@ -485,7 +492,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_v = self.from_v(v_sample)
         from_g = self.from_g(g_sample)
         h_mean_s = 0.5 * 1./self.alpha_prec * from_v**2
-        h_mean_s += from_v * (self.mu + from_g)
+        h_mean_s += 1./self.alpha_prec * from_v * (self.mu + from_g)
         h_mean = self.to_h(h_mean_s) + self.hbias
         return T.nnet.sigmoid(h_mean)
     
@@ -505,7 +512,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_g = self.from_g(g_sample)
         from_h = self.from_h(h_sample)
         from_v = self.from_v(v_sample)
-        s_mean = 1./self.alpha_prec * from_v * from_h + self.mu + from_g
+        s_mean = self.mu + 1./self.alpha_prec * (from_v * from_h + from_g)
         return s_mean
 
     def sample_s_given_ghv(self, g_sample, h_sample, v_sample, rng=None, size=None):
@@ -575,8 +582,8 @@ class BilinearSpikeSlabRBM(Model, Block):
     # FIXED POINT EQUATIONS FOR MEAN-FIELD #
     ########################################
     def g_hat(self, h_hat, s1_hat, s0_hat):
-        g_hat_s  = self.alpha_prec * self.s_hat(h_hat, s1_hat, s0_hat)
-        g_hat_s -= self.alpha_prec * self.mu
+        g_hat_s  = self.s_hat(h_hat, s1_hat, s0_hat)
+        g_hat_s -= self.mu
         g_hat_mean = self.to_g(g_hat_s) + self.gbias
         return T.nnet.sigmoid(g_hat_mean)
 
@@ -594,11 +601,12 @@ class BilinearSpikeSlabRBM(Model, Block):
     def s1_hat(self, g_hat, v):
         from_v = self.from_v(v)
         from_g = self.from_g(g_hat)
-        s1_hat = 1./self.alpha_prec * from_v + self.mu + from_g
+        s1_hat = 1./self.alpha_prec * (from_v + from_g) + self.mu
         return s1_hat
 
     def s0_hat(self, g_hat, v):
-        s0_hat = self.mu + self.from_g(g_hat)
+        from_g = self.from_g(g_hat)
+        s0_hat = 1./self.alpha_prec * from_g + self.mu
         return s0_hat
 
     ##################
