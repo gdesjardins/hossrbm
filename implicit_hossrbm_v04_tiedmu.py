@@ -43,7 +43,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('truncate_s', False)
         flags.setdefault('truncate_v', False)
         flags.setdefault('scalar_lambd', False)
-        flags.setdefault('lambd_interaction', False)
         flags.setdefault('wg_norm', 'none')
         flags.setdefault('wh_norm', 'none')
         flags.setdefault('wv_norm', 'none')
@@ -165,28 +164,28 @@ class BilinearSpikeSlabRBM(Model, Block):
             self.iscales['Wg'] = 1./numpy.sqrt(max(self.n_g, self.n_s))
             self.iscales['Wh'] = 1./numpy.sqrt(max(self.n_h, self.n_s))
 
-        # init weight matrices
-        self.Wv = self.init_weight(self.iscales['Wv'], (self.n_v, self.n_s), 'Wv')
+        # Init (visible, slabs) weight matrix.
+        self.Wv = self.init_weight(self.iscales['Wv'], (self.n_v, self.n_s), 'Wv',
+                        normalize= (self.flags['wv_norm'] == 'unit'))
+        self.norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
+
+        # Initialize (slab, hidden) pooling matrix
         self.Wh = sharedX(self.sparse_hmask.mask.T * self.iscales.get('Wh', 1.0), name='Wh')
+
+        # Initialize (slabs, g-unit) weight matrix.
         if self.sparse_gmask:
             self.Wg = sharedX(self.sparse_gmask.mask.T * self.iscales.get('Wg', 1.0), name='Wg')
         else:
             self.Wg = self.init_weight(self.iscales['Wg'], (self.n_s, self.n_g), 'Wg')
 
-        # avg norm (for wgh_norm='roland')
-        norm_wg = numpy.sqrt(numpy.sum(self.Wg.get_value()**2, axis=1)).mean()
-        norm_wh = numpy.sqrt(numpy.sum(self.Wh.get_value()**2, axis=0)).mean()
-        norm_wv = numpy.sqrt(numpy.sum(self.Wv.get_value()**2, axis=0)).mean()
-        self.avg_norm_wg = sharedX(norm_wg, name='avg_norm_wg')
-        self.avg_norm_wh = sharedX(norm_wh, name='avg_norm_wh')
-        self.avg_norm_wv = sharedX(norm_wv, name='avg_norm_wv')
-
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
+        self.cg = sharedX(0.5 * numpy.ones(self.n_g), name='cg')
+        self.ch = sharedX(0.5 * numpy.ones(self.n_h), name='ch')
 
         # mean (mu) and precision (alpha) parameters on s
-        self.mu = sharedX(self.iscales['mu'] * numpy.ones(self.n_s), name='mu')
+        self.mu = self.norm_wv
         self.alpha = sharedX(self.iscales['alpha'] * numpy.ones(self.n_s), name='alpha')
         self.alpha_prec = T.nnet.softplus(self.alpha)
 
@@ -206,9 +205,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_v  = self.rng.normal(loc=0, scale=scale, size=(self.batch_size, self.n_v))
         self.neg_v  = sharedX(neg_v, name='neg_v')
         # initialize s-chain
-        loc = self.mu.get_value()
         scale = numpy.sqrt(1./softplus(self.alpha.get_value()))
-        neg_s  = self.rng.normal(loc=loc, scale=scale, size=(self.batch_size, self.n_s))
+        neg_s  = self.rng.normal(loc=0., scale=scale, size=(self.batch_size, self.n_s))
         self.neg_s  = sharedX(neg_s, name='neg_s')
         # initialize binary g-h chains
         pval_g = sigm(self.gbias.get_value())
@@ -225,7 +223,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         """
         Returns a list of learnt model parameters.
         """
-        params = [self.Wv, self.Wg, self.hbias, self.gbias, self.alpha, self.mu, self.lambd]
+        params = [self.Wv, self.Wg, self.hbias, self.gbias, self.alpha, self.lambd]
         if self.flags['split_norm']:
             params += [self.scalar_norms]
         return params
@@ -246,25 +244,32 @@ class BilinearSpikeSlabRBM(Model, Block):
         pos_updates = self.pos_phase_updates(
                 self.input,
                 n_steps = self.pos_steps)
-        self.inference_func = theano.function([self.input],
-                [pos_updates[self.pos_g], pos_updates[self.pos_h]])
+
+        pos_g = pos_updates[self.pos_g]
+        pos_h = pos_updates[self.pos_h]
+        pos_s1 = pos_updates[self.pos_s1]
+        pos_s0 = pos_updates[self.pos_s0]
+        pos_s = self.s_hat(pos_h, pos_s1, pos_s0)
+        self.inference_func = theano.function([self.input], [pos_g, pos_h, pos_s])
 
         ##
         # BUILD COST OBJECTS
         ##
         lcost = self.ml_cost(
-                        pos_g = pos_updates[self.pos_g],
-                        pos_h = pos_updates[self.pos_h],
-                        pos_s1 = pos_updates[self.pos_s1],
-                        pos_s0 = pos_updates[self.pos_s0],
+                        pos_g = pos_g,
+                        pos_h = pos_h,
+                        pos_s1 = pos_s1,
+                        pos_s0 = pos_s0,
                         pos_v = self.input,
                         neg_g = neg_updates[self.neg_g],
                         neg_h = neg_updates[self.neg_h],
                         neg_s = neg_updates[self.neg_s],
                         neg_v = neg_updates[self.neg_v])
+
         #spcost = self.get_sparsity_cost(
                         #pos_g = pos_updates[self.pos_g],
                         #pos_h = pos_updates[self.pos_h])
+
         regcost = self.get_reg_cost(self.l2, self.l1)
 
         ##
@@ -275,14 +280,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
 
-        weight_updates = OrderedDict()
-        if self.flags['wg_norm'] == 'unit' and self.Wg in self.params():
-            weight_updates[self.Wg] = true_gradient(self.Wg, -learning_grads[self.Wg])
-        if self.flags['wh_norm'] == 'unit' and self.Wh in self.params():
-            weight_updates[self.Wh] = true_gradient(self.Wh, -learning_grads[self.Wh])
-        if self.flags['wv_norm'] == 'unit':
-            weight_updates[self.Wv] = true_gradient(self.Wv, -learning_grads[self.Wv])
-
         ##
         # BUILD UPDATES DICTIONARY FROM GRADIENTS
         ##
@@ -290,7 +287,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         learning_updates.update(pos_updates)
         learning_updates.update(neg_updates)
         learning_updates.update({self.iter: self.iter+1})
-        learning_updates.update(weight_updates)
 
         # build theano function to train on a single minibatch
         self.batch_train_func = function([self.input], [],
@@ -313,6 +309,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def get_constraint_updates(self):
         constraint_updates = OrderedDict() 
+
         if self.flags['scalar_lambd']:
             constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
 
@@ -364,18 +361,18 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_v = self.from_v(v_sample)
         from_h = self.from_h(h_sample)
         from_g = self.from_g(g_sample)
-        cg_sample = g_sample - 0.5 if self.flags['center_g'] else g_sample
-        ch_sample = h_sample - 0.5 if self.flags['center_h'] else h_sample
+        cg_sample = g_sample - self.cg if self.flags['center_g'] else g_sample
+        ch_sample = h_sample - self.ch if self.flags['center_h'] else h_sample
 
         energy  = 0.
         energy -= T.sum(from_v * s_sample * from_h, axis=1)
         energy += 0.5 * T.sum(self.alpha_prec * s_sample**2, axis=1)
         energy += T.sum(0.5 * self.lambd_prec * v_sample**2, axis=1)
         energy -= T.sum(self.alpha_prec * self.mu * s_sample, axis=1)
-        energy -= T.sum((s_sample - self.mu) * from_g, axis=1)
+        energy -= T.sum(self.alpha_prec * (s_sample - self.mu) * from_g, axis=1)
         energy -= T.dot(cg_sample, self.gbias)
         energy -= T.dot(ch_sample, self.hbias)
-        return T.mean(energy), [g_sample, h_sample, s_sample, v_sample]
+        return energy, [g_sample, h_sample, s_sample, v_sample]
 
     def eq_log_pstar_vgh(self, g_hat, h_hat, s1_hat, s0_hat, v):
         """
@@ -388,18 +385,21 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_v = self.from_v(v)
         from_h = self.from_h(h_hat)
         from_g = self.from_g(g_hat)
-        s_hat  = self.s_hat(h_hat, s1_hat, s0_hat)
-        ss_hat = self.s_hat(h_hat, s1_hat**2 + 1./self.alpha_prec,
-                                   s0_hat**2 + 1./self.alpha_prec)
-        cg_hat = g_hat - 0.5 if self.flags['center_g'] else g_hat
-        ch_hat = h_hat - 0.5 if self.flags['center_h'] else h_hat
+
+        # center variables
+        cg_hat = g_hat - self.cg if self.flags['center_g'] else g_hat
+        ch_hat = h_hat - self.ch if self.flags['center_h'] else h_hat
+        # compute expectation of various s-quantities
+        s_hat  = self.s_hat(ch_hat, s1_hat, s0_hat)
+        ss_hat = self.s_hat(ch_hat, s1_hat**2 + 1./self.alpha_prec,
+                                    s0_hat**2 + 1./self.alpha_prec)
 
         lq  = 0.
         lq += T.sum(from_v * s1_hat * from_h, axis=1)
         lq -= 0.5 * T.sum(self.alpha_prec * ss_hat, axis=1)
         lq -= T.sum(0.5 * self.lambd_prec * v**2, axis=1)
         lq += T.sum(self.alpha_prec * self.mu * s_hat, axis=1)
-        lq += T.sum(from_g  * (s_hat - self.mu), axis=1)
+        lq += T.sum(self.alpha_prec * from_g  * (s_hat - self.mu), axis=1)
         lq += T.dot(cg_hat, self.gbias)
         lq += T.dot(ch_hat, self.hbias)
         return T.mean(lq), [g_hat, h_hat, s_hat, ss_hat, s1_hat, s0_hat, v]
@@ -447,23 +447,19 @@ class BilinearSpikeSlabRBM(Model, Block):
     ######################################
 
     def from_v(self, v_sample):
-        Wv = self.Wv
+        Wv = self.Wv / self.norm_wv
         if self.flags['split_norm']:
             Wv *= self.scalar_norms
-        if self.flags['lambd_interaction']:
-            temp = self.lambd_prec * v_sample
-        else:
-            temp = v_sample
-        return T.dot(temp, Wv)
+        return T.dot(self.lambd_prec * v_sample, Wv)
 
     def from_g(self, g_sample):
         if self.flags['center_g']:
-            g_sample = g_sample - 0.5
+            g_sample = g_sample - self.cg
         return T.dot(g_sample, self.Wg.T)
 
     def from_h(self, h_sample):
         if self.flags['center_h']:
-            h_sample = h_sample - 0.5
+            h_sample = h_sample - self.ch
         return T.dot(h_sample, self.Wh.T)
 
     def to_g(self, g_s):
@@ -473,7 +469,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         return T.dot(h_s, self.Wh)
 
     def g_given_s(self, s_sample):
-        g_mean = self.to_g((s_sample - self.mu)) + self.gbias
+        g_mean_s = self.alpha_prec * (s_sample - self.mu)
+        g_mean = self.to_g(g_mean_s) + self.gbias
         return T.nnet.sigmoid(g_mean)
 
     def sample_g_given_s(self, s_sample, rng=None, size=None):
@@ -492,7 +489,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_v = self.from_v(v_sample)
         from_g = self.from_g(g_sample)
         h_mean_s = 0.5 * 1./self.alpha_prec * from_v**2
-        h_mean_s += 1./self.alpha_prec * from_v * (self.mu + from_g)
+        h_mean_s += from_v * (self.mu + from_g)
         h_mean = self.to_h(h_mean_s) + self.hbias
         return T.nnet.sigmoid(h_mean)
     
@@ -512,7 +509,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_g = self.from_g(g_sample)
         from_h = self.from_h(h_sample)
         from_v = self.from_v(v_sample)
-        s_mean = self.mu + 1./self.alpha_prec * (from_v * from_h + from_g)
+        s_mean = self.mu + from_g +  1./self.alpha_prec * from_v * from_h
         return s_mean
 
     def sample_s_given_ghv(self, g_sample, h_sample, v_sample, rng=None, size=None):
@@ -548,8 +545,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         from_h = self.from_h(h_sample)
         v_mean = T.dot(s_sample * from_h, Wv.T)
-        if not self.flags['lambd_interaction']:
-            v_mean *= 1./self.lambd_prec
         return v_mean
 
     def sample_v_given_hs(self, h_sample, s_sample, rng=None, size=None):
@@ -582,8 +577,8 @@ class BilinearSpikeSlabRBM(Model, Block):
     # FIXED POINT EQUATIONS FOR MEAN-FIELD #
     ########################################
     def g_hat(self, h_hat, s1_hat, s0_hat):
-        g_hat_s  = self.s_hat(h_hat, s1_hat, s0_hat)
-        g_hat_s -= self.mu
+        s_hat  = self.s_hat(h_hat, s1_hat, s0_hat)
+        g_hat_s = self.alpha_prec * (s_hat - self.mu)
         g_hat_mean = self.to_g(g_hat_s) + self.gbias
         return T.nnet.sigmoid(g_hat_mean)
 
@@ -601,41 +596,17 @@ class BilinearSpikeSlabRBM(Model, Block):
     def s1_hat(self, g_hat, v):
         from_v = self.from_v(v)
         from_g = self.from_g(g_hat)
-        s1_hat = 1./self.alpha_prec * (from_v + from_g) + self.mu
+        s1_hat = 1./self.alpha_prec * from_v + from_g + self.mu
         return s1_hat
 
     def s0_hat(self, g_hat, v):
         from_g = self.from_g(g_hat)
-        s0_hat = 1./self.alpha_prec * from_g + self.mu
+        s0_hat = from_g + self.mu
         return s0_hat
 
     ##################
     # SAMPLING STUFF #
     ##################
-    def old_pos_phase(self, v, init_state, n_steps=1, eps=1e-3):
-        """
-        Mixed mean-field + sampling inference in positive phase.
-        :param v: input being conditioned on
-        :param init: dictionary of initial values
-        :param n_steps: number of Gibbs updates to perform afterwards.
-        """
-        def pos_mf_iteration(g1, h1, pos_counter, v):
-            h2 = self.h_hat(g1, v)
-            s2_1 = self.s1_hat(g1, v)
-            s2_0 = self.s0_hat(g1, v)
-            g2 = self.g_hat(h2, s2_1, s2_0)
-            # stopping criterion
-            stop = T.maximum(T.max(g2 - g1), T.max(h2 - h1))
-            return [g2, h2, s2_1, s2_0, pos_counter + 1], theano.scan_module.until(stop < eps)
-
-        rvals, updates = theano.scan(
-                pos_mf_iteration,
-                outputs_info = [init_state['g'], init_state['h'], None, None, 0.],
-                non_sequences = [v],
-                n_steps=n_steps)
-
-        return [rval[-1] for rval in rvals]
- 
     def pos_phase(self, v, init_state, n_steps=1, eps=1e-3):
         """
         Mixed mean-field + sampling inference in positive phase.
@@ -678,8 +649,8 @@ class BilinearSpikeSlabRBM(Model, Block):
             assert n_steps
             # start sampler from scratch
             init_state = OrderedDict()
-            init_state['g'] = T.ones((self.batch_size,self.n_g)) * T.nnet.sigmoid(self.gbias)
-            init_state['h'] = T.ones((self.batch_size,self.n_h)) * T.nnet.sigmoid(self.hbias)
+            init_state['g'] = T.ones((v.shape[0], self.n_g)) * T.nnet.sigmoid(self.gbias)
+            init_state['h'] = T.ones((v.shape[0], self.n_h)) * T.nnet.sigmoid(self.hbias)
 
         [new_g, new_h, new_s1, new_s0, crap_v, pos_counter] = self.pos_phase(
                 v, init_state=init_state, n_steps=n_steps)
@@ -749,8 +720,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         # - dlogZ/dtheta = E_p[ denergy / dtheta ]
         neg_cost, neg_cte = self.energy(neg_g, neg_h, neg_s, neg_v)
         # build gradient of cost with respect to model parameters
-        cost = - (pos_cost + neg_cost)
-        cte = pos_cte + neg_cte
+        cost = - (pos_cost + T.mean(neg_cost))
+        cte = pos_cte + neg_cte + [self.norm_wv]
         return costmod.Cost(cost, self.params(), cte)
 
 
@@ -817,7 +788,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_vector(self.gbias))
         chans.update(self.monitor_vector(self.hbias))
         chans.update(self.monitor_vector(self.alpha_prec, name='alpha_prec'))
-        chans.update(self.monitor_vector(self.mu))
+        chans.update(self.monitor_vector(self.mu, name='mu'))
         chans.update(self.monitor_vector(self.lambd_prec, name='lambd_prec'))
         chans.update(self.monitor_matrix(self.pos_g))
         chans.update(self.monitor_matrix(self.pos_h))
@@ -845,11 +816,20 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.sample_s_func = theano.function([], neg_s)
         self.sample_v_func = theano.function([], neg_v)
 
+        # Build function to compute energies.
+        gg = T.matrix('g')
+        hh = T.matrix('h')
+        ss = T.matrix('s')
+        vv = T.matrix('v')
+        E, _crap = self.energy(gg,hh,ss,vv)
+        self.energy_func = theano.function([gg,hh,ss,vv], E)
+
+
+import pylab as pl
+
 class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
 
-    def setup(self, model, dataset):
-
-        x = dataset.get_batch_design(10000, include_labels=False)
+    def init_params_from_data(self, model, x):
 
         if model.flags['ml_lambd']:
             # compute maximum likelihood solution for lambd
@@ -859,4 +839,31 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
             neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
             model.neg_v.set_value(neg_v.astype(floatX))
 
+        """
+        [pos_g, pos_h, pos_s] = model.inference_func(x)
+        if model.flags['center_g']:
+            model.cg.set_value(pos_g.mean(axis=0).astype(floatX))
+        if model.flags['center_h']:
+            model.ch.set_value(pos_h.mean(axis=0).astype(floatX))
+  
+        [pos_g, pos_h, pos_s] = model.inference_func(x)
+        e1 = model.energy_func(pos_g, pos_h, pos_s, x)
+        pl.hist(e1, bins=100); pl.show()
+
+        if model.flags['igo_init']:
+            hbias_init = rbm_utils.compute_ml_bias(pos_h)
+            model.hbias.set_value(-hbias_init)
+            gbias_init = rbm_utils.compute_ml_bias(pos_g)
+            model.gbias.set_value(-gbias_init)
+        
+        [pos_g, pos_h, pos_s] = model.inference_func(x); e1 = model.energy_func(pos_g, pos_h, pos_s, x); pl.hist(e1, bins=100); pl.show()
+
+        import pdb; pdb.set_trace()
+        """
+
+
+    def setup(self, model, dataset):
+
+        x = dataset.get_batch_design(10000, include_labels=False)
+        self.init_params_from_data(model, x)
         super(TrainingAlgorithm, self).setup(model, dataset)
