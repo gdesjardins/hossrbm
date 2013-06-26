@@ -279,6 +279,10 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         learning_grads = costmod.compute_gradients(self.lr, self.lr_mults, *main_cost)
 
+        weight_updates = OrderedDict()
+        if self.flags['wv_norm'] == 'unit':
+            weight_updates[self.Wv] = true_gradient(self.Wv, -learning_grads[self.Wv])
+
         ##
         # BUILD UPDATES DICTIONARY FROM GRADIENTS
         ##
@@ -286,6 +290,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         learning_updates.update(pos_updates)
         learning_updates.update(neg_updates)
         learning_updates.update({self.iter: self.iter+1})
+        learning_updates.update(weight_updates)
 
         # build theano function to train on a single minibatch
         self.batch_train_func = function([self.input], [],
@@ -308,6 +313,10 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def get_constraint_updates(self):
         constraint_updates = OrderedDict() 
+
+        if self.flags['wv_norm'] == 'unit':
+            norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
+            constraint_updates[self.Wv] = self.Wv / norm_wv
 
         if self.flags['scalar_lambd']:
             constraint_updates[self.lambd] = T.mean(self.lambd) * T.ones_like(self.lambd)
@@ -409,7 +418,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         init_state['g'] = T.ones((v.shape[0],self.n_g)) * T.nnet.sigmoid(self.gbias)
         init_state['h'] = T.ones((v.shape[0],self.n_h)) * T.nnet.sigmoid(self.hbias)
         [g, h, s2_1, s2_0, v, pos_counter] = self.pos_phase(v, init_state, n_steps=self.pos_steps)
-        s = s2_1
+        s = self.s_hat(h, s2_1, s2_0)
 
         atoms = {
             'g_s' : self.from_g(g),  # g in s-space
@@ -424,6 +433,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             ## factored representations
             'g' : g,
             'h' : h,
+            's' : s,
             'gh' : (g.dimshuffle(0,1,'x') * h.dimshuffle(0,'x',1)).flatten(ndim=2),
             'gs': g * atoms['s_g'],
             'hs': h * atoms['s_h'],
