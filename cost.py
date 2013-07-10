@@ -58,7 +58,7 @@ def compute_gradients(lr, multipliers=None, *costs):
     return rval
 
 
-def get_updates(grads, momentum_lambda=None):
+def get_updates(grads, momentum_dict=None):
     """
     Returns an updates dictionary corresponding to a single step of SGD. The learning rate
     for each parameter is computed as lr * multipliers[param]
@@ -72,10 +72,10 @@ def get_updates(grads, momentum_lambda=None):
 
     for (param, gparam) in grads.iteritems():
 
-        if momentum_lambda:
+        if momentum_dict and momentum_dict[param]:
             # create storage for momentum term
             momentum[param] = sharedX(numpy.zeros_like(param.get_value()), name=param.name + '_old')
-            new_grad = (1.-momentum_lambda) * gparam + momentum_lambda * momentum[param]
+            new_grad = (1. - momentum_dict[param]) * gparam + momentum_dict[param] * momentum[param]
             updates[param] = param - new_grad
             updates[momentum[param]] = new_grad
         else:
