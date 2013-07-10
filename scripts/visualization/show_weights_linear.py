@@ -123,8 +123,8 @@ def plot(w):
     return copy.copy(main_viewer.image)
 
 
-viewer_g = make_viewer(wvg, get_dims(model.n_g), (opts.height, opts.width), is_color=True)
-viewer_h = make_viewer(wvh, get_dims(model.n_h), (opts.height, opts.width), is_color=True)
+viewer_g = make_viewer(wvg, get_dims(model.n_g), (opts.height, opts.width), is_color=opts.color)
+viewer_h = make_viewer(wvh, get_dims(model.n_h), (opts.height, opts.width), is_color=opts.color)
 w_image = plot(wv)
 
 viewer = PatchViewer((1, 3),
@@ -142,4 +142,4 @@ pl.axis('off')
 pl.imshow(viewer.image, interpolation='nearest')
 pl.savefig('filters_%s.png' % opts.path)
 if not opts.noshow:
-    pl.show()
+    viewer.show()

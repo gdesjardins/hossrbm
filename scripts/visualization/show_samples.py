@@ -36,7 +36,7 @@ def get_dims(nf):
 
 # load model and retrieve parameters
 model = serial.load(opts.path)
-fov_samples = model.neg_ev.get_value()
+fov_samples = model.neg_v.get_value()
 
 # store weight matrix as dataset, in case we have to process them
 dataset = DenseDesignMatrix(X=fov_samples)

@@ -24,6 +24,7 @@ parser.add_option('--height', action='store', type='int', dest='height')
 parser.add_option('--channels',  action='store', type='int', dest='chans')
 parser.add_option('--color', action='store_true',  dest='color', default=False)
 parser.add_option('--top', action='store', type='int', dest='top', default=5)
+parser.add_option('--mu', action='store_true',  dest='mu', default=False)
 parser.add_option('--wv_only', action='store_true', dest='wv_only', default=False)
 (opts, args) = parser.parse_args()
 
@@ -43,6 +44,8 @@ viewdims = slice(0, None) if opts.color else 0
 # load model and retrieve parameters
 model = serial.load(opts.path)
 wv = model.Wv.get_value().T
+if opts.mu:
+    wv = wv * model.mu.get_value()[:, None]
 
 wv_viewer = PatchViewer(get_dims(len(wv)), (opts.height, opts.width),
                         is_color = opts.color, pad=(2,2))
