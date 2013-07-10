@@ -14,7 +14,7 @@ class SparsityMask(object):
             setattr(self,k,v)
 
     @classmethod
-    def unfactored_g(cls, n_g, n_h, bw_g, bw_h):
+    def hossrbm_block_g(cls, n_g, n_h, bw_g, bw_h):
         """
         Creates a sparsity mask for g-units, equivalent to an unfactored model.
         :param n_g: number of g-units
@@ -35,7 +35,7 @@ class SparsityMask(object):
         return SparsityMask(mask.T, n_g=n_g, n_h=n_h, bw_g=bw_g, bw_h=bw_h)
 
     @classmethod
-    def unfactored_h(cls, n_g, n_h, bw_g, bw_h):
+    def hossrbm_block_h(cls, n_g, n_h, bw_g, bw_h):
         """
         Creates a sparsity mask for h-units, equivalent to an unfactored model.
         :param n_g: number of g-units
@@ -56,8 +56,25 @@ class SparsityMask(object):
             mask[bi*ds + hi%bw_h:(bi+1)*ds:bw_h, hi] = 1.
 
         return SparsityMask(mask.T, n_g=n_g, n_h=n_h, bw_g=bw_g, bw_h=bw_h)
+ 
+    @classmethod
+    def blockdiag(cls, n_h, n_s, bw_h=1, bw_s=1, dw_s=None):
+        """
+        Creates a sparsity mask for latent variables pooling over a subset of slab variables.
+        :param n_h: number of h-units
+        :param n_s: number of slabs
+        :param bw: number of slabs variables per h.
+        """
+        dw_s = bw_s if dw_s is None else dw_s
+
+        # init Wh
+        si = 0
+        mask = numpy.zeros((n_h, n_s))
+        for hi, si in zip(xrange(0, n_h, bw_h), xrange(0, n_s, dw_s)):
+            mask[hi:hi+bw_h, si:si+bw_s] = 1.
+
+        return SparsityMask(mask, n_h=n_h, n_s=n_s, bw_h=bw_h, bw_s=bw_s)
         
-    
     """
     Methods to implement a diagonal sparsity_mask
     """
