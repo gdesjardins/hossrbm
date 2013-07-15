@@ -52,7 +52,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('wbw_term', False)
         flags.setdefault('pos_phase_ch', False)
         flags.setdefault('standardize_s', False)
-        if len(flags.keys()) != 12:
+        flags.setdefault('whiten_s', False)
+        if len(flags.keys()) != 13:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def load_params(self, model):
@@ -190,6 +191,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         # Init (visible, slabs) weight matrix.
         self.Wv = self.init_weight(self.iscales['Wv'], (self.n_v, self.n_s), 'Wv',
                 normalize = self.flags['wv_norm'] == 'unit')
+        self.pos_s_std = sharedX(numpy.ones(self.n_s), 'pos_s_std')
+        self._Wv = 1./(self.pos_s_std + 1e-1) * self.Wv
+
         self.norm_wv = T.sqrt(T.sum(self.Wv**2, axis=0))
         self.mu = sharedX(self.iscales['mu'] * numpy.ones(self.n_s), name='mu')
 
@@ -197,12 +201,12 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.Wh = sharedX(self.sparse_hmask.mask.T * self.iscales.get('Wh', 1.0), name='Wh')
 
         # Initialize (slabs, g-unit) weight matrix.
-        self.pos_s_std = sharedX(numpy.ones(self.n_s), 'Wg1')
+        self.Ug = self.init_weight(self.iscales['Ug'], (self.n_s, self.n_s), 'Ug')
         if self.sparse_gmask:
             self.Wg = sharedX(self.sparse_gmask.mask.T * self.iscales.get('Wg', 1.0), name='Wg')
         else:
             self.Wg = self.init_weight(self.iscales['Wg'], (self.n_s, self.n_g), 'Wg')
-        self._Wg = T.shape_padright(1./(self.pos_s_std + 1e-1)) * self.Wg
+        self._Wg = T.dot(self.Ug, self.Wg)
 
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
@@ -264,7 +268,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         new_pos_s_std = self.pos_s_std * 0.999 + self.pos_s.std(axis=0) * 0.001
         norm_s_updates = {}
         norm_s_updates[self.pos_s_std] = new_pos_s_std
-        norm_s_updates[self.Wg] = T.shape_padright(self.pos_s_std / new_pos_s_std) * self.Wg
+        norm_s_updates[self.Wv] = self.pos_s_std / new_pos_s_std * self.Wv
         self.standardize_s = theano.function([], [], updates=norm_s_updates)
 
         # SAMPLING: NEGATIVE PHASE
@@ -368,6 +372,21 @@ class BilinearSpikeSlabRBM(Model, Block):
         return constraint_updates
 
     def train_batch(self, dataset, batch_size):
+
+        if self.flags['whiten_s'] and self.batches_seen % 1000 == 0:
+            print '*** Rebuilding whitening matrix for s ***'
+            from scipy import linalg
+            x = dataset.get_batch_design(5 * self.n_s, include_labels=False)
+            if self.flags['truncate_v']:
+                x = numpy.clip(x, -self.truncation_bound['v'], self.truncation_bound['v'])
+            self.inference_func(x)
+            pos_s = self.pos_s.get_value()
+            pos_s = pos_s - pos_s.mean(axis=0)
+            eigs, eigv = linalg.eigh(numpy.dot(pos_s.T, pos_s) / pos_s.shape[0])
+            new_Ug = eigv * numpy.sqrt(1.0 / eigs)
+            new_Wg = numpy.dot(numpy.dot(linalg.inv(new_Ug), self.Ug.get_value()), self.Wg.get_value())
+            self.Ug.set_value(new_Ug)
+            self.Wg.set_value(new_Wg)
 
         x = dataset.get_batch_design(batch_size, include_labels=False)
         if self.flags['truncate_v']:
@@ -867,6 +886,11 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_matrix(p_h_given_gv_term1, name='p_h_given_gv_term1', abs_mean=False))
         chans.update(self.monitor_matrix(p_h_given_gv_term2, name='p_h_given_gv_term2', abs_mean=False))
         chans.update(self.monitor_vector(p_h_given_gv_term3, name='p_h_given_gv_term3', abs_mean=False))
+
+        if self.flags['standardize_s']:
+            chans.update(self.monitor_vector(self.pos_s_std))
+        if self.flags['whiten_s']:
+            chans.update(self.monitor_matrix(self.Ug))
 
         return chans
 
