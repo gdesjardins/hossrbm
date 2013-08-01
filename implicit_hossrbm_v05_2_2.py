@@ -49,16 +49,18 @@ def trunc_gauss_Z(mu, sigma, a, b):
     Z = Phi(beta) - Phi(alpha)
     return Z
 
-def trunc_gauss_ent(mu, sigma, a, b):
+def gauss_ent(mu, sigma, a=None, b=None):
     cte = npy_floatX(numpy.sqrt(2 * numpy.pi * numpy.exp(1)))
-    alpha = (a - mu) / sigma
-    beta  = (b - mu) / sigma
-    Z = Phi(beta) - Phi(alpha)
-    rval  = T.log(cte * sigma * Z)
-    rval += (alpha * phi(alpha) - beta * phi(beta)) / (2*Z)
-    rval -= (phi(alpha) - phi(beta))**2 / (2*Z**2)
+    if a is None and b is None:
+        rval  = T.log(cte * sigma)
+    else:
+        alpha = (a - mu) / sigma
+        beta  = (b - mu) / sigma
+        Z = Phi(beta) - Phi(alpha)
+        rval  = T.log(cte * sigma * Z)
+        rval += (alpha * phi(alpha) - beta * phi(beta)) / (2*Z)
+        rval -= (phi(alpha) - phi(beta))**2 / (2*Z**2)
     return rval
-
 
 class BilinearSpikeSlabRBM(Model, Block):
     """Spike & Slab Restricted Boltzmann Machine (RBM)  """
@@ -368,8 +370,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         learning_updates.update(neg_updates)
         learning_updates.update({self.iter: self.iter+1})
         learning_updates.update(weight_updates)
-        pos_s = self.pos_h * self.pos_s1 + (1-self.pos_h) * self.pos_s0
-        learning_updates.update(self.statistics_updates(self.input, pos_s))
+        learning_updates.update(self.statistics_updates(self.input, self.pos_h, self.pos_s1, self.pos_s0))
 
         # build theano function to train on a single minibatch
         self.batch_train_func = function([self.input], [],
@@ -390,14 +391,15 @@ class BilinearSpikeSlabRBM(Model, Block):
         # Before we start learning, make sure constraints are enforced
         self.enforce_constraints()
 
-    def statistics_updates(self, v_sample, s_sample):
-
+    def statistics_updates(self, v_sample, h_sample, s1, s0):
+        from_h = self.from_h(h_sample)
+        pos_s = from_h * s1 + (1-from_h) * s0
         updates = OrderedDict()
         # monitor statistics of linear projection of v
         linproj_v = 1./self.alpha_prec * self.from_v(v_sample)
         updates[self.linproj_v_std] = linproj_v.std(axis=0)
         # monitor statistics of linear projection of s
-        linproj_s = 1./self.beta_prec * self.from_s(s_sample)
+        linproj_s = 1./self.beta_prec * self.from_s(pos_s)
         updates[self.linproj_s_std] = linproj_s.std(axis=0)
         return updates
 
@@ -484,36 +486,69 @@ class BilinearSpikeSlabRBM(Model, Block):
         energy -= T.dot(ch_sample, self.hbias)
         return energy, [g_sample, t_sample, h_sample, s_sample, v_sample]
 
-    def lbound_plus(self, g, t1, h, s1_mean, s1_var, s0_mean, s0_var, v):
+    def lbound_plus(self, g, t1_mean, h, s1_mean, s1_var, s0_mean, s0_var, v,
+                    s_stats_const=True, t_stats_const=True):
         """
         Computes the expectation (under the variational distribution q(g,h)=q(g)q(h)) of the
         log un-normalized probability, i.e. log p^*(g,h,s,v)
         """
-        # E[s] = E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
-        s = h * s1_mean + (1-h) * s0_mean
-        t = g * t1 + (1-g) * 0.
-        # E[s^2] = (E[s|h=1]^2 + 1./alpha) p(h=1) + (E[s|h=0]^2 + 1./alpha) p(h=0)
-        ss = h * (s1_mean**2 + s1_var) + (1-h) * (s0_mean**2 + s0_var)
-        tt = g * (t1**2 + 1./self.beta_prec)  + (1-g) * (0 + 1./self.beta_prec)
-
         # center variables
         cg = g - self.cg if self.flags['center_g'] else g
         ch = h - self.ch if self.flags['center_h'] else h
         from_h = self.from_h(h)
-        from_s = self.from_s(s)
+
+        # E[s] = E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
+        s = from_h * s1_mean + (1-from_h) * s0_mean
+        t = g * t1_mean + (1-g) * 0.
+        # E[s^2] = (E[s|h=1]^2 + 1./alpha) p(h=1) + (E[s|h=0]^2 + 1./alpha) p(h=0)
+        ss = from_h * (s1_mean**2 + s1_var) + (1-from_h) * (s0_mean**2 + s0_var)
+        tt = g * (t1_mean**2 + 1./self.beta_prec)  + (1-g) * (0 + 1./self.beta_prec)
+        
         from_v = self.from_v(v)
+        from_s = self.from_s(s)
 
         lq  = 0.
         lq -= T.sum(0.5 * self.lambd_prec * v**2, axis=1)
         lq += T.sum(from_v * (self._mu + s1_mean) * from_h, axis=1)
         lq -= 0.5 * T.sum(self.alpha_prec * ss, axis=1)
-        lq += T.sum(from_s * (self._nu + t1) * g, axis=1)
+        lq += T.sum(from_s * (self._nu + t1_mean) * g, axis=1)
         lq -= 0.5 * T.sum(self.beta_prec * tt, axis=1)
         lq += T.dot(cg, self.gbias)
         lq += T.dot(ch, self.hbias)
-        return T.mean(lq), [g, t, tt, t1, h, s, ss, s1_mean, s0_mean, v]
 
-    #def lbound_entropy(self, g, g_ t1, h, s1_mean, s1_var, s0_mean, s0_var, v):
+        cte = [g, t1_mean, h, s1_mean, s1_var, s0_mean, s0_var, v]
+        if s_stats_const:
+            cte += [s, ss]
+        if t_stats_const:
+            cte += [t, tt]
+
+        return T.mean(lq), cte
+
+    def entropy_term(self, g, t1_mu, h, s1_mu, s0_mu):
+
+        b = self.truncation_bounds['s'] if self.flags['truncate_s'] else None
+        a = -b if self.flags['truncate_s'] else None
+
+        # entropy from q(h,s)
+        rval  = -T.xlogx.xlogx(h) - T.xlogx.xlogx(1-h)
+        rval += h * gauss_ent(s1_mu, self.alpha_sigma, a, b)
+        rval += (1-h) * gauss_ent(s0_mu, self.alpha_sigma, a, b)
+        # entropy from q(g,t)
+        rval += -T.xlogx.xlogx(g) - T.xlogx.xlogx(1-g)
+        rval += g * gauss_ent(t1_mu, self.alpha_sigma, a, b)
+        cte = [g, t1_mu, h, s1_mu, s0_mu]
+        return rval, cte
+
+    def lbound(self, g, t1_mu, t1_mean, h, s1_mu, s1_mean, s1_var,
+               s0_mu, s0_mean, s0_var, v,
+               s_stats_const=True, t_stats_const=True):
+
+        rval1, cte1 = self.lbound_plus(g, t1_mean, h,
+                s1_mean, s1_var, s0_mean, s0_var, v,
+                s_stats_const, t_stats_const)
+
+        rval2, cte2 = self.entropy_term(g, t1_mu, h, s1_mu, s0_mu)
+        return rval1 + rval2, cte1 + cte2
 
     def __call__(self, v, output_type='g+h'):
         print 'Building representation with %s' % output_type
@@ -765,11 +800,11 @@ class BilinearSpikeSlabRBM(Model, Block):
             # IMPORTANT: for truncation gaussian, E[s1] != mu 
             (new_s1_mean, new_s1_var) = self.s_stats(new_s1_mu)
             (new_s0_mean, new_s0_var) = self.s_stats(new_s0_mu)
-            new_s = new_s1_mean * new_h + new_s0_mean * (1-new_h)
+            new_s = new_s1_mean * self.from_h(new_h) + new_s0_mean * (1-self.from_h(new_h))
 
-            lbound1, _crap = self.lbound_plus(g, t1, new_h,
-                    new_s1_mean, new_s1_var,
-                    new_s0_mean, new_s0_var, v)
+            lbound1, _crap = self.lbound(g, t1, t1, new_h,
+                    new_s1_mu, new_s1_mean, new_s1_var,
+                    new_s0_mu, new_s0_mean, new_s0_var, v)
 
             # new_g := E[g=1] 
             new_g = self.g_given_s(new_s)
@@ -787,14 +822,15 @@ class BilinearSpikeSlabRBM(Model, Block):
             stop = T.maximum(dl_dghat, dl_dhhat)
             #stop = T.maximum(T.max(new_g - g), T.max(new_h - h))
 
-            lbound2, _crap = self.lbound_plus(new_g, new_t1, new_h,
-                    new_s1_mean, new_s1_var,
-                    new_s0_mean, new_s0_var, v)
+            lbound2, _crap = self.lbound(new_g, new_t1, new_t1, new_h,
+                    new_s1_mu, new_s1_mean, new_s1_var,
+                    new_s0_mu, new_s0_mean, new_s0_var, v)
 
             return [new_g, new_t1, new_h,
                     new_s1_mean, new_s1_var,
                     new_s0_mean, new_s0_var, v,
-                    Print('lbound1=')(lbound1), Print('lbound2=')(lbound2),
+                    Print('lbound1=')(T.mean(lbound1)),
+                    Print('lbound2=')(T.mean(lbound2)),
                     pos_counter+1],\
                    theano.scan_module.until(stop < eps)
 
@@ -914,7 +950,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         neg_cost, neg_cte = self.energy(neg_g, neg_t, neg_h, neg_s, neg_v)
 
         # build gradient of cost with respect to model parameters
-        cost = - (pos_cost + T.mean(neg_cost))
+        cost = - (T.mean(pos_cost) + T.mean(neg_cost))
         cte = pos_cte + neg_cte
 
         return costmod.Cost(cost, self.params(), cte)
@@ -1029,34 +1065,43 @@ class BilinearSpikeSlabRBM(Model, Block):
                    s1_mu, s1_mean, s1_var,
                    s0_mu, s0_mean, s0_var, v):
 
-        s_hat = h * s1_mean + (1-h) * s0_mean
-        dlbound_plus  = self.from_s(s_hat) * (self._nu + t1)
-        dlbound_plus -= 0.5 * self.beta_prec * t1**2
-        dlbound_plus += self.gbias
-        rval  = g * (1-g) * dlbound_plus
-        rval += - (1 - g) * T.xlogx.xlogx(g) + g * T.xlogx.xlogx(1 - g)
-        return rval
+        #s_hat = h * s1_mean + (1-h) * s0_mean
+        #dlbound_plus  = self.from_s(s_hat) * (self._nu + t1)
+        #dlbound_plus -= 0.5 * self.beta_prec * t1**2
+        #dlbound_plus += self.gbias
+        #rval  = g * (1-g) * dlbound_plus
+        #rval += - (1 - g) * T.xlogx.xlogx(g) + g * T.xlogx.xlogx(1 - g)
+
+        lbound, cte = self.lbound(g, t1, t1, h,
+                s1_mu, s1_mean, s1_var,
+                s0_mu, s0_mean, s0_var, v, 
+                t_stats_const=False)
+        dlbound_dg = T.grad(T.mean(lbound), [g], consider_constant=cte)[0]
+        return  g * (1-g) * dlbound_dg
 
     def dlbound_dh(self, g, t1, h,
                    s1_mu, s1_mean, s1_var,
                    s0_mu, s0_mean, s0_var, v):
 
-        temp  = self.from_v(v) * (self._mu + s1_mean)
-        temp -= 0.5 * self.alpha_prec * (s1_mean**2 + s1_var)
-        temp += 0.5 * self.alpha_prec * (s0_mean**2 + s0_var)
-        temp += self.alpha_prec * (s1_mean - s0_mean) * self.from_gt(g, t1)
-        dlbound_plus = self.to_h(temp) + self.hbias
+        #temp  = self.from_v(v) * (self._mu + s1_mean)
+        #temp -= 0.5 * self.alpha_prec * (s1_mean**2 + s1_var)
+        #temp += 0.5 * self.alpha_prec * (s0_mean**2 + s0_var)
+        #temp += self.alpha_prec * (s1_mean - s0_mean) * self.from_gt(g, t1)
+        #dlbound_plus = self.to_h(temp) + self.hbias
+        # rval = h * (1-h) * dlbound_plus
+        # rval += - (1 - h) * T.xlogx.xlogx(h) + h * T.xlogx.xlogx(1 - h)
+        #if self.flags['truncate_s']:
+            #b = self.truncation_bound['s']
+            #dent_ds1 = trunc_gauss_ent(s1_mu, self.alpha_sigma, -b, b)
+            #dent_ds0 = trunc_gauss_ent(s0_mu, self.alpha_sigma, -b, b)
+            #rval += h * (1-h) * (dent_ds1 - dent_ds0)
 
-        rval  = h * (1-h) * dlbound_plus
-        rval += - (1 - h) * T.xlogx.xlogx(h) + h * T.xlogx.xlogx(1 - h)
-
-        if self.flags['truncate_s']:
-            b = self.truncation_bound['s']
-            dent_ds1 = trunc_gauss_ent(s1_mu, self.alpha_sigma, -b, b)
-            dent_ds0 = trunc_gauss_ent(s0_mu, self.alpha_sigma, -b, b)
-            rval += h * (1-h) * (dent_ds1 - dent_ds0)
-
-        return rval
+        lbound, cte = self.lbound(g, t1, t1, h,
+                s1_mu, s1_mean, s1_var,
+                s0_mu, s0_mean, s0_var, v, 
+                s_stats_const=False)
+        dlbound_dh = T.grad(T.mean(lbound), [h], consider_constant=cte)[0]
+        return h * (1-h) * dlbound_dh
 
     def init_debug(self):
         pass
