@@ -8,6 +8,7 @@ to those without visible-visible and hidden-hidden connections.
 import numpy
 import md5
 import pickle
+import copy
 from collections import OrderedDict
 
 import theano
@@ -245,6 +246,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         # precision parameters on t
         self.beta = sharedX(self.iscales['beta'] * numpy.ones(self.n_g), name='beta')
         self.beta_prec = T.nnet.softplus(self.beta)
+        self.beta_sigma = T.sqrt(1./self.beta_prec)
 
         # Initialize (slab, hidden) pooling matrix
         self.Wh = sharedX(self.sparse_hmask.mask.T * self.iscales.get('Wh', 1.0), name='Wh')
@@ -258,8 +260,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
-        self.cg = sharedX(0.5 * numpy.ones(self.n_g), name='cg')
-        self.ch = sharedX(0.5 * numpy.ones(self.n_h), name='ch')
+        # WARNING: CHANGE BACK TO 0.5
+        self.cg = sharedX(0. * numpy.ones(self.n_g), name='cg')
+        self.ch = sharedX(0. * numpy.ones(self.n_h), name='ch')
 
         # diagonal of precision matrix of visible units
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
@@ -495,7 +498,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         # center variables
         cg = g - self.cg if self.flags['center_g'] else g
         ch = h - self.ch if self.flags['center_h'] else h
-        from_h = self.from_h(h)
+        from_h = self.from_h(ch)
 
         # E[s] = E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
         s = from_h * s1_mean + (1-from_h) * s0_mean
@@ -522,20 +525,17 @@ class BilinearSpikeSlabRBM(Model, Block):
         if t_stats_const:
             cte += [t, tt]
 
-        return T.mean(lq), cte
+        return lq, cte
 
     def entropy_term(self, g, t1_mu, h, s1_mu, s0_mu):
-
-        b = self.truncation_bounds['s'] if self.flags['truncate_s'] else None
+        b = self.truncation_bound['s'] if self.flags['truncate_s'] else None
         a = -b if self.flags['truncate_s'] else None
-
         # entropy from q(h,s)
-        rval  = -T.xlogx.xlogx(h) - T.xlogx.xlogx(1-h)
-        rval += h * gauss_ent(s1_mu, self.alpha_sigma, a, b)
-        rval += (1-h) * gauss_ent(s0_mu, self.alpha_sigma, a, b)
+        rval  = T.sum(-T.xlogx.xlogx(h) - T.xlogx.xlogx(1-h), axis=1)
+        rval += T.sum(h * gauss_ent(s1_mu, self.alpha_sigma, a, b), axis=1)
+        rval += T.sum((1-h) * gauss_ent(s0_mu, self.alpha_sigma, a, b), axis=1)
         # entropy from q(g,t)
-        rval += -T.xlogx.xlogx(g) - T.xlogx.xlogx(1-g)
-        rval += g * gauss_ent(t1_mu, self.alpha_sigma, a, b)
+        rval += T.sum(-T.xlogx.xlogx(g) - T.xlogx.xlogx(1-g), axis=1)
         cte = [g, t1_mu, h, s1_mu, s0_mu]
         return rval, cte
 
@@ -546,7 +546,6 @@ class BilinearSpikeSlabRBM(Model, Block):
         rval1, cte1 = self.lbound_plus(g, t1_mean, h,
                 s1_mean, s1_var, s0_mean, s0_var, v,
                 s_stats_const, t_stats_const)
-
         rval2, cte2 = self.entropy_term(g, t1_mu, h, s1_mu, s0_mu)
         return rval1 + rval2, cte1 + cte2
 
@@ -781,7 +780,7 @@ class BilinearSpikeSlabRBM(Model, Block):
     # SAMPLING STUFF #
     ##################
 
-    def pos_phase(self, v, init_state, n_steps=1, eps=1e-6):
+    def pos_phase(self, v, init_state, n_steps=1, eps=1e-3):
         """
         Mixed mean-field + sampling inference in positive phase.
         :param v: input being conditioned on
@@ -819,7 +818,7 @@ class BilinearSpikeSlabRBM(Model, Block):
 
             dl_dghat = Print('max_dl_dghat')(T.max(abs(self.dlbound_dg(*dlbound_args))))
             dl_dhhat = Print('max_dl_dhhat')(T.max(abs(self.dlbound_dh(*dlbound_args))))
-            stop = T.maximum(dl_dghat, dl_dhhat)
+            stop = T.maximum(T.max(dl_dghat), T.max(dl_dhhat))
             #stop = T.maximum(T.max(new_g - g), T.max(new_h - h))
 
             lbound2, _crap = self.lbound(new_g, new_t1, new_t1, new_h,
@@ -1065,42 +1064,144 @@ class BilinearSpikeSlabRBM(Model, Block):
                    s1_mu, s1_mean, s1_var,
                    s0_mu, s0_mean, s0_var, v):
 
-        #s_hat = h * s1_mean + (1-h) * s0_mean
-        #dlbound_plus  = self.from_s(s_hat) * (self._nu + t1)
-        #dlbound_plus -= 0.5 * self.beta_prec * t1**2
-        #dlbound_plus += self.gbias
-        #rval  = g * (1-g) * dlbound_plus
-        #rval += - (1 - g) * T.xlogx.xlogx(g) + g * T.xlogx.xlogx(1 - g)
+        """
+        ##############################
+        _h = self.rng.rand(self.batch_size, self.n_h).astype(floatX)
+        _t1 = self.rng.normal(0, 2.0, size=(self.batch_size, self.n_g)).astype(floatX)
+        _s1 = self.rng.normal(1., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
+        _s0 = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
+        _v = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_v)).astype(floatX)
+
+        delta = 1e-3
+        _garg = self.rng.rand(self.batch_size, self.n_g).astype(floatX) - 0.5
+        _garg1 = copy.copy(_garg)
+        _garg2 = copy.copy(_garg)
+        _garg1[0,0] -= delta
+        _garg2[0,0] += delta
+
+        ggarg = T.matrix() 
+        hh = T.matrix() 
+        tt1 = T.matrix()
+        ss1_mu = T.matrix()
+        ss0_mu = T.matrix()
+        vv = T.matrix()
+
+        gg = T.nnet.sigmoid(ggarg)
+        (ss1_mean, ss1_var) = self.s_stats(ss1_mu)
+        (ss0_mean, ss0_var) = self.s_stats(ss0_mu)
+
+        lbound, cte = self.lbound(gg, tt1, tt1, hh,
+                ss1_mu, ss1_mean, ss1_var,
+                ss0_mu, ss0_mean, ss0_var, vv, 
+                s_stats_const=False)
+        dlbound_dg = T.grad(T.sum(lbound), [ggarg], consider_constant=None)[0]
+
+        ######### AUTOMATIC DIFF IMPLEMENTATION ####
+        df = theano.function([ggarg, hh, tt1, ss1_mu, ss0_mu, vv], dlbound_dg)
+        print 'df[0,0]:', df(_garg, _h, _t1, _s1, _s0, _v)[0,0]
+        ##############################
+
+        ######### MANUAL GRAD IMPLEMENTATION ####
+        ss_hat = hh * ss1_mean + (1-hh) * ss0_mean
+        dlbound_plus  = self.from_s(ss_hat) * (self._nu + tt1)
+        dlbound_plus -= 0.5 * self.beta_prec * tt1**2
+        dlbound_plus += self.gbias
+        rval  = gg * (1-gg) * dlbound_plus
+        rval += - (1 - gg) * T.xlogx.xlogx(gg) + gg * T.xlogx.xlogx(1 - gg)
+
+        df_manual = theano.function([ggarg, hh, tt1, ss1_mu, ss0_mu], rval)
+        print 'df_manual[0,0]:', df_manual(_garg, _h, _t1, _s1, _s0)[0,0]
+        ##############################
+
+        ######### FINITE DIFF IMPLEMENTATION ####
+        f = theano.function([ggarg, hh, tt1, ss1_mu, ss0_mu, vv], lbound)
+        f1 = f(_garg1, _h, _t1, _s1, _s0, _v)[0]
+        f2 = f(_garg2, _h, _t1, _s1, _s0, _v)[0]
+        print 'fdiff df[0,0]:', (f2 - f1) / (2 * delta)
+        ##############################
+        import pdb; pdb.set_trace()
+        """
 
         lbound, cte = self.lbound(g, t1, t1, h,
                 s1_mu, s1_mean, s1_var,
                 s0_mu, s0_mean, s0_var, v, 
                 t_stats_const=False)
-        dlbound_dg = T.grad(T.mean(lbound), [g], consider_constant=cte)[0]
+        dlbound_dg = T.grad(T.sum(lbound), [g], consider_constant=cte)[0]
         return  g * (1-g) * dlbound_dg
 
     def dlbound_dh(self, g, t1, h,
                    s1_mu, s1_mean, s1_var,
                    s0_mu, s0_mean, s0_var, v):
 
-        #temp  = self.from_v(v) * (self._mu + s1_mean)
-        #temp -= 0.5 * self.alpha_prec * (s1_mean**2 + s1_var)
-        #temp += 0.5 * self.alpha_prec * (s0_mean**2 + s0_var)
-        #temp += self.alpha_prec * (s1_mean - s0_mean) * self.from_gt(g, t1)
-        #dlbound_plus = self.to_h(temp) + self.hbias
-        # rval = h * (1-h) * dlbound_plus
-        # rval += - (1 - h) * T.xlogx.xlogx(h) + h * T.xlogx.xlogx(1 - h)
-        #if self.flags['truncate_s']:
-            #b = self.truncation_bound['s']
-            #dent_ds1 = trunc_gauss_ent(s1_mu, self.alpha_sigma, -b, b)
-            #dent_ds0 = trunc_gauss_ent(s0_mu, self.alpha_sigma, -b, b)
-            #rval += h * (1-h) * (dent_ds1 - dent_ds0)
+        """
+        ##############################
+        _g = self.rng.rand(self.batch_size, self.n_g).astype(floatX)
+        _t1 = self.rng.normal(0, 2.0, size=(self.batch_size, self.n_g)).astype(floatX)
+        _s1 = self.rng.normal(1., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
+        _s0 = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
+        _v = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_v)).astype(floatX)
+
+        delta = 1e-3
+        _harg = self.rng.rand(self.batch_size, self.n_h).astype(floatX) - 0.5
+        _harg1 = copy.copy(_harg)
+        _harg2 = copy.copy(_harg)
+        _harg1[0,0] -= delta
+        _harg2[0,0] += delta
+
+        gg = T.matrix() 
+        hharg = T.matrix() 
+        tt1 = T.matrix()
+        ss1_mu = T.matrix()
+        ss0_mu = T.matrix()
+        vv = T.matrix()
+
+        hh = T.nnet.sigmoid(hharg)
+        (ss1_mean, ss1_var) = self.s_stats(ss1_mu)
+        (ss0_mean, ss0_var) = self.s_stats(ss0_mu)
+
+        lbound, cte = self.lbound(gg, tt1, tt1, hh,
+                ss1_mu, ss1_mean, ss1_var,
+                ss0_mu, ss0_mean, ss0_var, vv, 
+                s_stats_const=False)
+        dlbound_dh = T.grad(T.sum(lbound), [hharg], consider_constant=None)[0]
+
+        ######### AUTOMATIC DIFF IMPLEMENTATION ####
+        df = theano.function([gg, hharg, tt1, ss1_mu, ss0_mu, vv], dlbound_dh)
+        print 'df[0,0]:', df(_g, _harg, _t1, _s1, _s0, _v)[0,0]
+        ##############################
+
+        ######### MANUAL GRAD IMPLEMENTATION ####
+        temp  = self.from_v(vv) * (self._mu + ss1_mean)
+        temp -= 0.5 * self.alpha_prec * (ss1_mean**2 + ss1_var)
+        temp += 0.5 * self.alpha_prec * (ss0_mean**2 + ss0_var)
+        temp += self.alpha_prec * (ss1_mean - ss0_mean) * self.from_gt(gg, tt1)
+        dlbound_plus = self.to_h(temp) + self.hbias
+        rval = hh * (1-hh) * dlbound_plus
+        rval += - (1 - hh) * T.xlogx.xlogx(hh) + hh * T.xlogx.xlogx(1 - hh)
+        if self.flags['truncate_s']:
+            b = self.truncation_bound['s']
+            dent_ds1 = gauss_ent(ss1_mu, self.alpha_sigma, -b, b)
+            dent_ds0 = gauss_ent(ss0_mu, self.alpha_sigma, -b, b)
+            rval += hh * (1-hh) * (dent_ds1 - dent_ds0)
+
+        df_manual = theano.function([gg, hharg, tt1, ss1_mu, ss0_mu, vv], rval)
+        print 'df_manual[0,0]:', df_manual(_g, _harg, _t1, _s1, _s0, _v)[0,0]
+        ##############################
+
+        ######### FINITE DIFF IMPLEMENTATION ####
+        f = theano.function([gg, hharg, tt1, ss1_mu, ss0_mu, vv], lbound)
+        f1 = f(_g, _harg1, _t1, _s1, _s0, _v)[0]
+        f2 = f(_g, _harg2, _t1, _s1, _s0, _v)[0]
+        print 'fdiff df[0,0]:', (f2 - f1) / (2 * delta)
+        ##############################
+        import pdb; pdb.set_trace()
+        """
 
         lbound, cte = self.lbound(g, t1, t1, h,
                 s1_mu, s1_mean, s1_var,
                 s0_mu, s0_mean, s0_var, v, 
                 s_stats_const=False)
-        dlbound_dh = T.grad(T.mean(lbound), [h], consider_constant=cte)[0]
+        dlbound_dh = T.grad(T.sum(lbound), [h], consider_constant=cte)[0]
         return h * (1-h) * dlbound_dh
 
     def init_debug(self):
