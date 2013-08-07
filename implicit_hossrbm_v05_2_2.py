@@ -260,8 +260,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
-        self.cg = sharedX(0.5 * numpy.ones(self.n_g), name='cg')
-        self.ch = sharedX(0.5 * numpy.ones(self.n_h), name='ch')
+        self.cg = sharedX(0. * numpy.ones(self.n_g), name='cg')
+        self.ch = sharedX(0. * numpy.ones(self.n_h), name='ch')
 
         # diagonal of precision matrix of visible units
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
@@ -508,17 +508,18 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_s = self.from_s(s)
 
         lq  = 0.
-        lq -= T.sum(0.5 * self.lambd_prec * v**2, axis=1)
+        lq -= 0.5 * T.sum(self.lambd_prec * v**2, axis=1)
+        lq -= 0.5 * T.sum(self.alpha_prec * ss, axis=1)
+        lq -= 0.5 * T.sum(self.beta_prec * tt, axis=1)
+
         lq += T.sum(from_v * (self._mu + s1_mean) * from_h, axis=1)
         if self.flags['center_h']:
             lq -= T.sum(from_v * (self._mu + s) * T.dot(self.ch, self.Wh.T), axis=1)
 
-        lq -= 0.5 * T.sum(self.alpha_prec * ss, axis=1)
         lq += T.sum(from_s * (self._nu + t1_mean) * g, axis=1)
         if self.flags['center_g']:
             lq -= T.sum(from_s * (self._nu + t) * self.cg, axis=1)
 
-        lq -= 0.5 * T.sum(self.beta_prec * tt, axis=1)
         lq += T.dot(cg, self.gbias)
         lq += T.dot(ch, self.hbias)
 
