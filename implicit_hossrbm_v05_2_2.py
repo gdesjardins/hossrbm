@@ -260,9 +260,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
-        # WARNING: CHANGE BACK TO 0.5
-        self.cg = sharedX(0. * numpy.ones(self.n_g), name='cg')
-        self.ch = sharedX(0. * numpy.ones(self.n_h), name='ch')
+        self.cg = sharedX(0.5 * numpy.ones(self.n_g), name='cg')
+        self.ch = sharedX(0.5 * numpy.ones(self.n_h), name='ch')
 
         # diagonal of precision matrix of visible units
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
@@ -270,8 +269,6 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def init_chains(self):
         """ Allocate shared variable for persistent chain """
-        self.lbound1 = sharedX(0., name='lbound1')
-        self.lbound2 = sharedX(0., name='lbound2')
         # initialize buffers to store inference state
         self.pos_g  = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_g')
         self.pos_t1 = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_t1')
@@ -395,7 +392,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.enforce_constraints()
 
     def statistics_updates(self, v_sample, h_sample, s1, s0):
-        from_h = self.from_h(h_sample)
+        from_h = self.from_h(h_sample, center=False)
         pos_s = from_h * s1 + (1-from_h) * s0
         updates = OrderedDict()
         # monitor statistics of linear projection of v
@@ -496,9 +493,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         log un-normalized probability, i.e. log p^*(g,h,s,v)
         """
         # center variables
+        from_h = self.from_h(h, center=False)
         cg = g - self.cg if self.flags['center_g'] else g
         ch = h - self.ch if self.flags['center_h'] else h
-        from_h = self.from_h(ch)
 
         # E[s] = E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
         s = from_h * s1_mean + (1-from_h) * s0_mean
@@ -513,8 +510,14 @@ class BilinearSpikeSlabRBM(Model, Block):
         lq  = 0.
         lq -= T.sum(0.5 * self.lambd_prec * v**2, axis=1)
         lq += T.sum(from_v * (self._mu + s1_mean) * from_h, axis=1)
+        if self.flags['center_h']:
+            lq -= T.sum(from_v * (self._mu + s) * T.dot(self.ch, self.Wh.T), axis=1)
+
         lq -= 0.5 * T.sum(self.alpha_prec * ss, axis=1)
         lq += T.sum(from_s * (self._nu + t1_mean) * g, axis=1)
+        if self.flags['center_g']:
+            lq -= T.sum(from_s * (self._nu + t) * self.cg, axis=1)
+
         lq -= 0.5 * T.sum(self.beta_prec * tt, axis=1)
         lq += T.dot(cg, self.gbias)
         lq += T.dot(ch, self.hbias)
@@ -603,8 +606,8 @@ class BilinearSpikeSlabRBM(Model, Block):
             g_sample = g_sample - self.cg
         return T.dot((self._nu + t_sample) * g_sample, self._Wg.T)
 
-    def from_h(self, h_sample):
-        if self.flags['center_h']:
+    def from_h(self, h_sample, center=True):
+        if center and self.flags['center_h']:
             h_sample = h_sample - self.ch
         return T.dot(h_sample, self.Wh.T)
 
@@ -666,13 +669,21 @@ class BilinearSpikeSlabRBM(Model, Block):
         from_v = self.from_v(v_sample)
         from_gt = self.from_gt(g_sample, t_sample)
         h_mean_s = from_v * (self._mu + from_gt)
-        h_mean_s += 0.5 * 1./self.alpha_prec * from_v**2
+
+        squared_term = 0.5 * 1./self.alpha_prec * from_v**2
+        if self.flags['center_h']:
+            squared_term *= (1 - 2*self.ch)
+        h_mean_s += squared_term
 
         if self.flags['truncate_s']:
             b = self.truncation_bound['s']
 
             h_ones  = T.ones((self.batch_size, self.n_h))
             h_zeros = T.zeros((self.batch_size, self.n_h))
+            if self.flags['center_h']:
+                h_ones -= self.ch
+                h_zeros-= self.ch
+
             s_mu_h1 = self.s_mu_given_gthv(g_sample, t_sample, h_ones, v_sample)
             s_mu_h0 = self.s_mu_given_gthv(g_sample, t_sample, h_zeros, v_sample)
 
@@ -799,11 +810,8 @@ class BilinearSpikeSlabRBM(Model, Block):
             # IMPORTANT: for truncation gaussian, E[s1] != mu 
             (new_s1_mean, new_s1_var) = self.s_stats(new_s1_mu)
             (new_s0_mean, new_s0_var) = self.s_stats(new_s0_mu)
-            new_s = new_s1_mean * self.from_h(new_h) + new_s0_mean * (1-self.from_h(new_h))
-
-            lbound1, _crap = self.lbound(g, t1, t1, new_h,
-                    new_s1_mu, new_s1_mean, new_s1_var,
-                    new_s0_mu, new_s0_mean, new_s0_var, v)
+            new_s = new_s1_mean * self.from_h(new_h, center=False) +\
+                    new_s0_mean * (1-self.from_h(new_h, center=False))
 
             # new_g := E[g=1] 
             new_g = self.g_given_s(new_s)
@@ -816,20 +824,13 @@ class BilinearSpikeSlabRBM(Model, Block):
                             new_s1_mu, new_s1_mean, new_s1_var,
                             new_s0_mu, new_s0_mean, new_s0_var, v]
 
-            dl_dghat = Print('max_dl_dghat')(T.max(abs(self.dlbound_dg(*dlbound_args))))
-            dl_dhhat = Print('max_dl_dhhat')(T.max(abs(self.dlbound_dh(*dlbound_args))))
-            stop = T.maximum(T.max(dl_dghat), T.max(dl_dhhat))
-            #stop = T.maximum(T.max(new_g - g), T.max(new_h - h))
-
-            lbound2, _crap = self.lbound(new_g, new_t1, new_t1, new_h,
-                    new_s1_mu, new_s1_mean, new_s1_var,
-                    new_s0_mu, new_s0_mean, new_s0_var, v)
+            dl_dghat = T.max(abs(self.dlbound_dg(*dlbound_args)))
+            dl_dhhat = T.max(abs(self.dlbound_dh(*dlbound_args)))
+            stop = T.maximum(dl_dghat, dl_dhhat)
 
             return [new_g, new_t1, new_h,
                     new_s1_mean, new_s1_var,
                     new_s0_mean, new_s0_var, v,
-                    Print('lbound1=')(T.mean(lbound1)),
-                    Print('lbound2=')(T.mean(lbound2)),
                     pos_counter+1],\
                    theano.scan_module.until(stop < eps)
 
@@ -839,8 +840,6 @@ class BilinearSpikeSlabRBM(Model, Block):
                   {'steps': 1}, {'steps': 1},
                   {'steps': 1}, {'steps': 1},
                   T.unbroadcast(T.shape_padleft(v)),
-                  {'steps': 1},
-                  {'steps': 1},
                   T.unbroadcast(T.shape_padleft(0.))
                   ]
 
@@ -881,9 +880,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         pos_updates[self.pos_s0] = rval[5]
         pos_updates[self.pos_s0_var] = rval[6]
         # rval[7] is not used.
-        pos_updates[self.lbound1] = rval[8]
-        pos_updates[self.lbound2] = rval[9]
-        pos_updates[self.pos_counter] = rval[10]
+        pos_updates[self.pos_counter] = rval[8]
 
         if self.flags['pos_phase_ch']:
             # TODO: move to statistics_updates
@@ -1064,64 +1061,6 @@ class BilinearSpikeSlabRBM(Model, Block):
                    s1_mu, s1_mean, s1_var,
                    s0_mu, s0_mean, s0_var, v):
 
-        """
-        ##############################
-        _h = self.rng.rand(self.batch_size, self.n_h).astype(floatX)
-        _t1 = self.rng.normal(0, 2.0, size=(self.batch_size, self.n_g)).astype(floatX)
-        _s1 = self.rng.normal(1., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
-        _s0 = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
-        _v = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_v)).astype(floatX)
-
-        delta = 1e-3
-        _garg = self.rng.rand(self.batch_size, self.n_g).astype(floatX) - 0.5
-        _garg1 = copy.copy(_garg)
-        _garg2 = copy.copy(_garg)
-        _garg1[0,0] -= delta
-        _garg2[0,0] += delta
-
-        ggarg = T.matrix() 
-        hh = T.matrix() 
-        tt1 = T.matrix()
-        ss1_mu = T.matrix()
-        ss0_mu = T.matrix()
-        vv = T.matrix()
-
-        gg = T.nnet.sigmoid(ggarg)
-        (ss1_mean, ss1_var) = self.s_stats(ss1_mu)
-        (ss0_mean, ss0_var) = self.s_stats(ss0_mu)
-
-        lbound, cte = self.lbound(gg, tt1, tt1, hh,
-                ss1_mu, ss1_mean, ss1_var,
-                ss0_mu, ss0_mean, ss0_var, vv, 
-                s_stats_const=False)
-        dlbound_dg = T.grad(T.sum(lbound), [ggarg], consider_constant=None)[0]
-
-        ######### AUTOMATIC DIFF IMPLEMENTATION ####
-        df = theano.function([ggarg, hh, tt1, ss1_mu, ss0_mu, vv], dlbound_dg)
-        print 'df[0,0]:', df(_garg, _h, _t1, _s1, _s0, _v)[0,0]
-        ##############################
-
-        ######### MANUAL GRAD IMPLEMENTATION ####
-        ss_hat = hh * ss1_mean + (1-hh) * ss0_mean
-        dlbound_plus  = self.from_s(ss_hat) * (self._nu + tt1)
-        dlbound_plus -= 0.5 * self.beta_prec * tt1**2
-        dlbound_plus += self.gbias
-        rval  = gg * (1-gg) * dlbound_plus
-        rval += - (1 - gg) * T.xlogx.xlogx(gg) + gg * T.xlogx.xlogx(1 - gg)
-
-        df_manual = theano.function([ggarg, hh, tt1, ss1_mu, ss0_mu], rval)
-        print 'df_manual[0,0]:', df_manual(_garg, _h, _t1, _s1, _s0)[0,0]
-        ##############################
-
-        ######### FINITE DIFF IMPLEMENTATION ####
-        f = theano.function([ggarg, hh, tt1, ss1_mu, ss0_mu, vv], lbound)
-        f1 = f(_garg1, _h, _t1, _s1, _s0, _v)[0]
-        f2 = f(_garg2, _h, _t1, _s1, _s0, _v)[0]
-        print 'fdiff df[0,0]:', (f2 - f1) / (2 * delta)
-        ##############################
-        import pdb; pdb.set_trace()
-        """
-
         lbound, cte = self.lbound(g, t1, t1, h,
                 s1_mu, s1_mean, s1_var,
                 s0_mu, s0_mean, s0_var, v, 
@@ -1132,70 +1071,6 @@ class BilinearSpikeSlabRBM(Model, Block):
     def dlbound_dh(self, g, t1, h,
                    s1_mu, s1_mean, s1_var,
                    s0_mu, s0_mean, s0_var, v):
-
-        """
-        ##############################
-        _g = self.rng.rand(self.batch_size, self.n_g).astype(floatX)
-        _t1 = self.rng.normal(0, 2.0, size=(self.batch_size, self.n_g)).astype(floatX)
-        _s1 = self.rng.normal(1., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
-        _s0 = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_s)).astype(floatX)
-        _v = self.rng.normal(0., 1.0, size=(self.batch_size, self.n_v)).astype(floatX)
-
-        delta = 1e-3
-        _harg = self.rng.rand(self.batch_size, self.n_h).astype(floatX) - 0.5
-        _harg1 = copy.copy(_harg)
-        _harg2 = copy.copy(_harg)
-        _harg1[0,0] -= delta
-        _harg2[0,0] += delta
-
-        gg = T.matrix() 
-        hharg = T.matrix() 
-        tt1 = T.matrix()
-        ss1_mu = T.matrix()
-        ss0_mu = T.matrix()
-        vv = T.matrix()
-
-        hh = T.nnet.sigmoid(hharg)
-        (ss1_mean, ss1_var) = self.s_stats(ss1_mu)
-        (ss0_mean, ss0_var) = self.s_stats(ss0_mu)
-
-        lbound, cte = self.lbound(gg, tt1, tt1, hh,
-                ss1_mu, ss1_mean, ss1_var,
-                ss0_mu, ss0_mean, ss0_var, vv, 
-                s_stats_const=False)
-        dlbound_dh = T.grad(T.sum(lbound), [hharg], consider_constant=None)[0]
-
-        ######### AUTOMATIC DIFF IMPLEMENTATION ####
-        df = theano.function([gg, hharg, tt1, ss1_mu, ss0_mu, vv], dlbound_dh)
-        print 'df[0,0]:', df(_g, _harg, _t1, _s1, _s0, _v)[0,0]
-        ##############################
-
-        ######### MANUAL GRAD IMPLEMENTATION ####
-        temp  = self.from_v(vv) * (self._mu + ss1_mean)
-        temp -= 0.5 * self.alpha_prec * (ss1_mean**2 + ss1_var)
-        temp += 0.5 * self.alpha_prec * (ss0_mean**2 + ss0_var)
-        temp += self.alpha_prec * (ss1_mean - ss0_mean) * self.from_gt(gg, tt1)
-        dlbound_plus = self.to_h(temp) + self.hbias
-        rval = hh * (1-hh) * dlbound_plus
-        rval += - (1 - hh) * T.xlogx.xlogx(hh) + hh * T.xlogx.xlogx(1 - hh)
-        if self.flags['truncate_s']:
-            b = self.truncation_bound['s']
-            dent_ds1 = gauss_ent(ss1_mu, self.alpha_sigma, -b, b)
-            dent_ds0 = gauss_ent(ss0_mu, self.alpha_sigma, -b, b)
-            rval += hh * (1-hh) * (dent_ds1 - dent_ds0)
-
-        df_manual = theano.function([gg, hharg, tt1, ss1_mu, ss0_mu, vv], rval)
-        print 'df_manual[0,0]:', df_manual(_g, _harg, _t1, _s1, _s0, _v)[0,0]
-        ##############################
-
-        ######### FINITE DIFF IMPLEMENTATION ####
-        f = theano.function([gg, hharg, tt1, ss1_mu, ss0_mu, vv], lbound)
-        f1 = f(_g, _harg1, _t1, _s1, _s0, _v)[0]
-        f2 = f(_g, _harg2, _t1, _s1, _s0, _v)[0]
-        print 'fdiff df[0,0]:', (f2 - f1) / (2 * delta)
-        ##############################
-        import pdb; pdb.set_trace()
-        """
 
         lbound, cte = self.lbound(g, t1, t1, h,
                 s1_mu, s1_mean, s1_var,
