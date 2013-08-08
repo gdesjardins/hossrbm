@@ -67,6 +67,7 @@ class BilinearSpikeSlabRBM(Model, Block):
     """Spike & Slab Restricted Boltzmann Machine (RBM)  """
 
     def validate_flags(self, flags):
+        flags.setdefault('debug_inference', False)
         flags.setdefault('truncate_t', False)
         flags.setdefault('truncate_s', False)
         flags.setdefault('truncate_v', False)
@@ -81,7 +82,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('whiten_s', False)
         flags.setdefault('standardize_s', False)
         flags.setdefault('standardize_t', False)
-        if len(flags.keys()) != 14:
+        if len(flags.keys()) != 15:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def load_params(self, model):
@@ -622,7 +623,12 @@ class BilinearSpikeSlabRBM(Model, Block):
     def g_given_s(self, s_sample):
         from_s = self.from_s(s_sample) 
         g_mean = from_s * self._nu
-        g_mean += 0.5 * 1./self.beta_prec * from_s**2
+        
+        squared_term = 0.5 * 1./self.beta_prec * from_s**2
+        if self.flags['center_g']:
+            squared_term *= (1 - 2*self.cg)
+        g_mean += squared_term
+
         g_mean += self.gbias
         return T.nnet.sigmoid(g_mean)
 
@@ -672,8 +678,11 @@ class BilinearSpikeSlabRBM(Model, Block):
 
     def h_given_gtv(self, g_sample, t_sample, v_sample):
         from_v = self.from_v(v_sample)
-        from_gt = self.from_gt(g_sample, t_sample)
-        h_mean_s = from_v * (self._mu + from_gt)
+
+        temp = self._mu + self.from_gt(g_sample, t_sample)
+        if self.flags['center_g']:
+            temp -= self.from_gt(self.cg, g_sample * t_sample)
+        h_mean_s = from_v * temp
 
         squared_term = 0.5 * 1./self.alpha_prec * from_v**2
         if self.flags['center_h']:
@@ -805,12 +814,11 @@ class BilinearSpikeSlabRBM(Model, Block):
         """
         def pos_mf_iteration(g, t1, h, s1_mu, s0_mu, v, pos_counter):
 
-            ### DEBUG #### 
-            (s1_mean, s1_var) = self.s_stats(s1_mu)
-            (s0_mean, s0_var) = self.s_stats(s0_mu)
-            s = s1_mean * self.from_h(h, center=False) + s0_mean * (1-self.from_h(h, center=False))
-            lbound1, _crap = self.lbound(g, t1, t1, h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var, v)
-            ##############
+            if self.flags['debug_inference']:
+                (s1_mean, s1_var) = self.s_stats(s1_mu)
+                (s0_mean, s0_var) = self.s_stats(s0_mu)
+                s = s1_mean * self.from_h(h, center=False) + s0_mean * (1-self.from_h(h, center=False))
+                lbound1, _crap = self.lbound(g, t1, t1, h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var, v)
 
             #### ROUND 1: q(h,s) ########
             # new_h := E[h=1]
@@ -826,39 +834,48 @@ class BilinearSpikeSlabRBM(Model, Block):
             new_s = new_s1_mean * self.from_h(h, center=False) +\
                     new_s0_mean * (1-self.from_h(h, center=False))
 
-            lbound2, _crap = self.lbound(g, t1, t1, new_h,
-                new_s1_mu, new_s1_mean, new_s1_var,
-                new_s0_mu, new_s0_mean, new_s0_var, v)
-
+            if self.flags['debug_inference']:
+                lbound2, _crap = self.lbound(g, t1, t1, new_h,
+                    new_s1_mu, new_s1_mean, new_s1_var,
+                    new_s0_mu, new_s0_mean, new_s0_var, v)
 
             #### ROUND 2: q(g,t) ########
-
             # new_g := E[g=1] 
             new_g = self.g_given_s(new_s)
 
             # new_tX := E[t|g=X] 
             new_t1 = self.t_given_gs(T.ones((v.shape[0], self.n_g)), new_s)
 
-            lbound3, _crap = self.lbound(new_g, new_t1, new_t1, new_h,
-                new_s1_mu, new_s1_mean, new_s1_var,
-                new_s0_mu, new_s0_mean, new_s0_var, v)
+            if self.flags['debug_inference']:
+                lbound3, _crap = self.lbound(new_g, new_t1, new_t1, new_h,
+                    new_s1_mu, new_s1_mean, new_s1_var,
+                    new_s0_mu, new_s0_mean, new_s0_var, v)
  
             # stopping criterion
             dlbound_args = [new_g, new_t1, new_h,
                             new_s1_mu, new_s1_mean, new_s1_var,
                             new_s0_mu, new_s0_mean, new_s0_var, v]
 
-            dl_dghat = T.max(abs(self.dlbound_dg(*dlbound_args)))
-            dl_dhhat = T.max(abs(self.dlbound_dh(*dlbound_args)))
-            stop = T.maximum(Print('dl_dghat')(dl_dghat), Print('dl_dhhat')(dl_dhhat))
+            if self.flags['debug_inference']:
+                # ensure that derivative goes to 0 as bound gets tighter
+                dl_dghat = T.max(abs(self.dlbound_dg(*dlbound_args)))
+                dl_dhhat = T.max(abs(self.dlbound_dh(*dlbound_args)))
+                stop = T.maximum(Print('dl_dghat')(dl_dghat), Print('dl_dhhat')(dl_dhhat))
+            else:
+                # use value convergence as stopping criteria
+                stop = T.maximum(T.max(new_g - g),
+                         T.maximum(T.max(new_h - h),
+                            T.maximum(T.max(new_t1 - t1),
+                                T.maximum(T.max(new_s1_mu - s1_mu),
+                                          T.max(new_s0_mu - s0_mu)))))
 
             return [new_g, new_t1, new_h, new_s1_mu, new_s0_mu,
                     new_s1_mean, new_s1_var,
                     new_s0_mean, new_s0_var, v,
                     pos_counter+1,
-                    Print('lbound1')(T.sum(lbound1)),
-                    Print('lbound2')(T.sum(lbound2)),
-                    Print('lbound3')(T.sum(lbound3))],\
+                    Print('lbound1')(T.sum(lbound1)) if self.flags['debug_inference'] else npy_floatX(0),
+                    Print('lbound2')(T.sum(lbound2)) if self.flags['debug_inference'] else npy_floatX(0),
+                    Print('lbound3')(T.sum(lbound3)) if self.flags['debug_inference'] else npy_floatX(0)],
                    theano.scan_module.until(stop < eps)
 
         states = [T.unbroadcast(T.shape_padleft(init_state['g'])),
