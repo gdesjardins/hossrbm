@@ -78,11 +78,12 @@ class BilinearSpikeSlabRBM(Model, Block):
         flags.setdefault('init_mf_rand', False)
         flags.setdefault('center_g', False)
         flags.setdefault('center_h', False)
+        flags.setdefault('pos_phase_cg', False)
         flags.setdefault('pos_phase_ch', False)
         flags.setdefault('whiten_s', False)
         flags.setdefault('standardize_s', False)
         flags.setdefault('standardize_t', False)
-        if len(flags.keys()) != 15:
+        if len(flags.keys()) != 16:
             raise NotImplementedError('One or more flags are currently not implemented.')
 
     def load_params(self, model):
@@ -261,8 +262,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         # allocate shared variables for bias parameters
         self.gbias = sharedX(self.iscales['gbias'] * numpy.ones(self.n_g), name='gbias')
         self.hbias = sharedX(self.iscales['hbias'] * numpy.ones(self.n_h), name='hbias')
-        self.cg = sharedX(0. * numpy.ones(self.n_g), name='cg')
-        self.ch = sharedX(0. * numpy.ones(self.n_h), name='ch')
+        self.cg = sharedX(0.5 * numpy.ones(self.n_g), name='cg')
+        self.ch = sharedX(0.5 * numpy.ones(self.n_h), name='ch')
 
         # diagonal of precision matrix of visible units
         self.lambd = sharedX(self.iscales['lambd'] * numpy.ones(self.n_v), name='lambd')
@@ -274,8 +275,10 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.pos_g  = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_g')
         self.pos_t1 = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_t1')
         self.pos_h  = sharedX(numpy.zeros((self.batch_size, self.n_h)), name='pos_h')
+        self.pos_s1_mu = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s1_mu')
         self.pos_s1_mean = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s1_mean')
         self.pos_s1_var = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s1_var')
+        self.pos_s0_mu = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s0_mu')
         self.pos_s0_mean = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s0_mean')
         self.pos_s0_var = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s0_var')
         # initialize visible unit chains
@@ -607,8 +610,8 @@ class BilinearSpikeSlabRBM(Model, Block):
     def from_s(self, s_sample):
         return T.dot(self.alpha_prec * s_sample, self._Wg)
 
-    def from_gt(self, g_sample, t_sample):
-        if self.flags['center_g']:
+    def from_gt(self, g_sample, t_sample, center=True):
+        if center and self.flags['center_g']:
             g_sample = g_sample - self.cg
         return T.dot((self._nu + t_sample) * g_sample, self._Wg.T)
 
@@ -679,9 +682,9 @@ class BilinearSpikeSlabRBM(Model, Block):
     def h_given_gtv(self, g_sample, t_sample, v_sample):
         from_v = self.from_v(v_sample)
 
-        temp = self._mu + self.from_gt(g_sample, t_sample)
+        temp = self._mu + self.from_gt(g_sample, t_sample, center=False)
         if self.flags['center_g']:
-            temp -= self.from_gt(self.cg, g_sample * t_sample)
+            temp -= self.from_gt(self.cg, g_sample * t_sample, center=False)
         h_mean_s = from_v * temp
 
         squared_term = 0.5 * 1./self.alpha_prec * from_v**2
@@ -818,7 +821,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             E[h], E[s|h=1], E[s|h=0], E[s], E[g], E[t|g=1], E[t|g=0]=0.
             """
    
-            dummy = npy_floatX(0.)
+            dummy = T.constant(0, dtype=floatX)
 
             ################# START ITERATION #############
             if self.flags['debug_inference']:
@@ -944,8 +947,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         pos_updates[self.pos_g]  = rval[0]
         pos_updates[self.pos_t1] = rval[1]
         pos_updates[self.pos_h]  = rval[2]
-        # new_s1_mu := rval[3]
-        # new_s0_mu := rval[4]
+        pos_updates[self.pos_s1_mu] = rval[3]
+        pos_updates[self.pos_s0_mu] = rval[4]
         pos_updates[self.pos_s1_mean] = rval[5]
         pos_updates[self.pos_s1_var] = rval[6]
         pos_updates[self.pos_s0_mean] = rval[7]
@@ -954,10 +957,11 @@ class BilinearSpikeSlabRBM(Model, Block):
         pos_updates[self.pos_counter] = rval[10]
         pos_updates[self.lbound_temp] = rval[11]
 
+        # TODO: move to statistics_updates
+        if self.flags['pos_phase_cg']:
+            pos_updates[self.cg] = T.cast(0.999 * self.cg + 0.001 * rval[0].mean(axis=0), floatX)
         if self.flags['pos_phase_ch']:
-            # TODO: move to statistics_updates
-            pos_h = rval[2]
-            pos_updates[self.ch] = T.cast(0.999 * self.ch + 0.001 * pos_h.mean(axis=0), floatX)
+            pos_updates[self.ch] = T.cast(0.999 * self.ch + 0.001 * rval[2].mean(axis=0), floatX)
 
         return pos_updates
 
@@ -1105,7 +1109,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_matrix(self.pos_g))
         chans.update(self.monitor_matrix(self.pos_h))
         chans.update(self.monitor_gauss(self.pos_t1))
+        chans.update(self.monitor_gauss(self.pos_s1_mu))
         chans.update(self.monitor_gauss(self.pos_s1_mean))
+        chans.update(self.monitor_gauss(self.pos_s0_mu))
         chans.update(self.monitor_gauss(self.pos_s0_mean))
         chans.update(self.monitor_matrix(self.neg_g))
         chans.update(self.monitor_matrix(self.neg_h))
@@ -1169,9 +1175,12 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
             neg_v = model.rng.normal(loc=0, scale=scale, size=(model.batch_size, model.n_v))
             model.neg_v.set_value(neg_v.astype(floatX))
 
-        if model.flags['pos_phase_ch']:
+        if model.flags['pos_phase_ch'] or model.flags['pos_phase_cg']:
             model.inference_func(x[:model.batch_size])
-            model.ch.set_value(model.pos_h.get_value().mean(axis=0))
+            if model.flags['pos_phase_cg':
+                model.cg.set_value(model.pos_g.get_value().mean(axis=0))
+            if model.flags['pos_phase_ch':
+                model.ch.set_value(model.pos_h.get_value().mean(axis=0))
 
     def setup(self, model, dataset):
 
