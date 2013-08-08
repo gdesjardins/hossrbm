@@ -1177,9 +1177,9 @@ class TrainingAlgorithm(default.DefaultTrainingAlgorithm):
 
         if model.flags['pos_phase_ch'] or model.flags['pos_phase_cg']:
             model.inference_func(x[:model.batch_size])
-            if model.flags['pos_phase_cg':
+            if model.flags['pos_phase_cg']:
                 model.cg.set_value(model.pos_g.get_value().mean(axis=0))
-            if model.flags['pos_phase_ch':
+            if model.flags['pos_phase_ch']:
                 model.ch.set_value(model.pos_h.get_value().mean(axis=0))
 
     def setup(self, model, dataset):
