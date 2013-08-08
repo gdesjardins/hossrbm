@@ -300,9 +300,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         # other misc.
         self.pos_counter = sharedX(0., name='pos_counter')
         self.odd_even = sharedX(0., name='odd_even')
-        self.lbound1 = sharedX(0., name='lbound1')
-        self.lbound2 = sharedX(0., name='lbound2')
-        self.lbound3 = sharedX(0., name='lbound3')
+        self.lbound_temp = sharedX(0., name='lbound')
  
     def params(self):
         """
@@ -555,7 +553,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         rval1, cte1 = self.lbound_plus(g, t1_mean, h,
                 s1_mean, s1_var, s0_mean, s0_var, v,
                 s_stats_const, t_stats_const)
+
         rval2, cte2 = self.entropy_term(g, t1_mu, h, s1_mu, s0_mu)
+
         return rval1 + rval2, cte1 + cte2
 
     def __call__(self, v, output_type='g+h'):
@@ -813,44 +813,68 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param n_steps: number of Gibbs updates to perform afterwards.
         """
         def pos_mf_iteration(g, t1, h, s1_mu, s0_mu, v, pos_counter):
+            """
+            Mean-field computes the following statistics:
+            E[h], E[s|h=1], E[s|h=0], E[s], E[g], E[t|g=1], E[t|g=0]=0.
+            """
+   
+            dummy = npy_floatX(0.)
 
+            ################# START ITERATION #############
             if self.flags['debug_inference']:
-                (s1_mean, s1_var) = self.s_stats(s1_mu)
-                (s0_mean, s0_var) = self.s_stats(s0_mu)
-                s = s1_mean * self.from_h(h, center=False) + s0_mean * (1-self.from_h(h, center=False))
-                lbound1, _crap = self.lbound(g, t1, t1, h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var, v)
+                (_s1_mean, _s1_var) = self.s_stats(s1_mu)
+                (_s0_mean, _s0_var) = self.s_stats(s0_mu)
+                lbound, _crap = self.lbound(g, t1, t1, h, s1_mu, _s1_mean, _s1_var, s0_mu, _s0_mean, _s0_var, v)
+                dummy += Print('lbound0')(T.sum(lbound))
 
-            #### ROUND 1: q(h,s) ########
-            # new_h := E[h=1]
+            # (1) new_h := E[h=1]
             new_h = self.h_given_gtv(g, t1, v)
+            if self.flags['debug_inference']:
+                (_s1_mean, _s1_var) = self.s_stats(s1_mu)
+                (_s0_mean, _s0_var) = self.s_stats(s0_mu)
+                lbound, _crap = self.lbound(g, t1, t1, new_h, s1_mu, _s1_mean, _s1_var, s0_mu, _s0_mean, _s0_var, v)
+                dummy += Print('lbound1')(T.sum(lbound))
 
-            # new_s := E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
+            # (2) p(s|h=1) := N(new_s1_mu, 1./self.alpha_prec)
             new_s1_mu = self.s_mu_given_gthv(g, t1, T.ones((v.shape[0],  self.n_h)), v)
+            if self.flags['debug_inference']:
+                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
+                (_s0_mean, _s0_var) = self.s_stats(s0_mu)
+                lbound, _crap = self.lbound(g, t1, t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, s0_mu, _s0_mean, _s0_var, v)
+                dummy += Print('lbound2')(T.sum(lbound))
+
+            # (3) p(s|h=0) := N(new_s0_mu, 1./self.alpha_prec)
             new_s0_mu = self.s_mu_given_gthv(g, t1, T.zeros((v.shape[0], self.n_h)), v)
+            if self.flags['debug_inference']:
+                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
+                (_new_s0_mean, _new_s0_var) = self.s_stats(new_s0_mu)
+                lbound, _crap = self.lbound(g, t1, t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, new_s0_mu, _new_s0_mean, _new_s0_var, v)
+                dummy += Print('lbound3')(T.sum(lbound))
 
             # IMPORTANT: for truncation gaussian, E[s1] != mu 
             (new_s1_mean, new_s1_var) = self.s_stats(new_s1_mu)
             (new_s0_mean, new_s0_var) = self.s_stats(new_s0_mu)
-            new_s = new_s1_mean * self.from_h(h, center=False) +\
-                    new_s0_mean * (1-self.from_h(h, center=False))
+            # new_s := E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
+            new_s = new_s1_mean * self.from_h(new_h, center=False) +\
+                    new_s0_mean * (1-self.from_h(new_h, center=False))
 
-            if self.flags['debug_inference']:
-                lbound2, _crap = self.lbound(g, t1, t1, new_h,
-                    new_s1_mu, new_s1_mean, new_s1_var,
-                    new_s0_mu, new_s0_mean, new_s0_var, v)
-
-            #### ROUND 2: q(g,t) ########
-            # new_g := E[g=1] 
+            # (4) new_g := E[g=1] 
             new_g = self.g_given_s(new_s)
-
-            # new_tX := E[t|g=X] 
-            new_t1 = self.t_given_gs(T.ones((v.shape[0], self.n_g)), new_s)
-
             if self.flags['debug_inference']:
-                lbound3, _crap = self.lbound(new_g, new_t1, new_t1, new_h,
-                    new_s1_mu, new_s1_mean, new_s1_var,
-                    new_s0_mu, new_s0_mean, new_s0_var, v)
- 
+                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
+                (_new_s0_mean, _new_s0_var) = self.s_stats(new_s0_mu)
+                lbound, _crap = self.lbound(new_g, t1, t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, new_s0_mu, _new_s0_mean, _new_s0_var, v)
+                dummy += Print('lbound4')(T.sum(lbound))
+
+            # (5) p(t|g=1) := N(new_t1, 1./self.beta_prec)
+            new_t1 = self.t_given_gs(T.ones((v.shape[0], self.n_g)), new_s)
+            if self.flags['debug_inference']:
+                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
+                (_new_s0_mean, _new_s0_var) = self.s_stats(new_s0_mu)
+                lbound, _crap = self.lbound(new_g, new_t1, new_t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, new_s0_mu, _new_s0_mean, _new_s0_var, v)
+                dummy += Print('lbound5')(T.sum(lbound))
+            ################# DONE ITERATION #############
+
             # stopping criterion
             dlbound_args = [new_g, new_t1, new_h,
                             new_s1_mu, new_s1_mean, new_s1_var,
@@ -872,10 +896,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             return [new_g, new_t1, new_h, new_s1_mu, new_s0_mu,
                     new_s1_mean, new_s1_var,
                     new_s0_mean, new_s0_var, v,
-                    pos_counter+1,
-                    Print('lbound1')(T.sum(lbound1)) if self.flags['debug_inference'] else npy_floatX(0),
-                    Print('lbound2')(T.sum(lbound2)) if self.flags['debug_inference'] else npy_floatX(0),
-                    Print('lbound3')(T.sum(lbound3)) if self.flags['debug_inference'] else npy_floatX(0)],
+                    pos_counter+1, dummy],\
                    theano.scan_module.until(stop < eps)
 
         states = [T.unbroadcast(T.shape_padleft(init_state['g'])),
@@ -887,8 +908,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                   {'steps': 1}, {'steps': 1},
                   T.unbroadcast(T.shape_padleft(v)),
                   T.unbroadcast(T.shape_padleft(0.)),
-                      {'steps': 1}, {'steps': 1}, {'steps': 1},
-                  ]
+                  {'steps': 1}]
 
         rvals, updates = scan(
                 pos_mf_iteration,
@@ -932,9 +952,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         pos_updates[self.pos_s0_var] = rval[8]
         # rval[9] is not used.
         pos_updates[self.pos_counter] = rval[10]
-        pos_updates[self.lbound1] = rval[11]
-        pos_updates[self.lbound2] = rval[12]
-        pos_updates[self.lbound3] = rval[13]
+        pos_updates[self.lbound_temp] = rval[11]
 
         if self.flags['pos_phase_ch']:
             # TODO: move to statistics_updates
