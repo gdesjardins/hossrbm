@@ -95,10 +95,8 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.Wv.set_value(model.Wv.get_value())
         self.mu.set_value(model.mu.get_value())
         self.alpha.set_value(model.alpha.get_value())
-        self.gamma_s.set_value(model.gamma_s.get_value())
         self.nu.set_value(model.nu.get_value())
         self.beta.set_value(model.beta.get_value())
-        self.gamma_t.set_value(model.gamma_t.get_value())
         self.Wh.set_value(model.Wh.get_value())
         self.hbias.set_value(model.hbias.get_value())
         self.Wg.set_value(model.Wg.get_value())
@@ -110,6 +108,14 @@ class BilinearSpikeSlabRBM(Model, Block):
         self.neg_s.set_value(model.neg_s.get_value())
         self.neg_t.set_value(model.neg_t.get_value())
         self.neg_v.set_value(model.neg_v.get_value())
+
+        # centering and standardization
+        self.cg.set_value(model.cg.get_value())
+        self.ch.set_value(model.ch.get_value())
+        self.gamma_s.set_value(model.gamma_s.get_value())
+        self.gamma_t.set_value(model.gamma_t.get_value())
+        self.linproj_v_std.set_value(model.linproj_v_std.get_value())
+        self.linproj_s_std.set_value(model.linproj_s_std.get_value())
 
         # sync random number generators
         self.rng.set_state(model.rng.get_state())
@@ -273,7 +279,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         """ Allocate shared variable for persistent chain """
         # initialize buffers to store inference state
         self.pos_g  = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_g')
-        self.pos_t1 = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_t1')
+        self.pos_t1_mu = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_t1_mu')
+        self.pos_t1_mean = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_t1_mean')
+        self.pos_t1_var = sharedX(numpy.zeros((self.batch_size, self.n_g)), name='pos_t1_var')
         self.pos_h  = sharedX(numpy.zeros((self.batch_size, self.n_h)), name='pos_h')
         self.pos_s1_mu = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s1_mu')
         self.pos_s1_mean = sharedX(numpy.zeros((self.batch_size, self.n_s)), name='pos_s1_mean')
@@ -337,11 +345,12 @@ class BilinearSpikeSlabRBM(Model, Block):
         ##
         lcost = self.ml_cost(
                         pos_g = self.pos_g,
-                        pos_t1 = self.pos_t1,
+                        pos_t1_mean = self.pos_t1_mean,
+                        pos_t1_var = self.pos_t1_var,
                         pos_h = self.pos_h,
-                        pos_s1 = self.pos_s1_mean,
+                        pos_s1_mean = self.pos_s1_mean,
                         pos_s1_var = self.pos_s1_var,
-                        pos_s0 = self.pos_s0_mean,
+                        pos_s0_mean = self.pos_s0_mean,
                         pos_s0_var = self.pos_s0_var,
                         pos_v = self.input,
                         neg_g = neg_updates[self.neg_g],
@@ -492,7 +501,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         energy -= T.dot(ch_sample, self.hbias)
         return energy, [g_sample, t_sample, h_sample, s_sample, v_sample]
 
-    def lbound_plus(self, g, t1_mean, h, s1_mean, s1_var, s0_mean, s0_var, v,
+    def lbound_plus(self, g, t1_mean, t1_var, h, s1_mean, s1_var, s0_mean, s0_var, v,
                     s_stats_const=True, t_stats_const=True):
         """
         Computes the expectation (under the variational distribution q(g,h)=q(g)q(h)) of the
@@ -508,7 +517,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         t = g * t1_mean + (1-g) * 0.
         # E[s^2] = (E[s|h=1]^2 + 1./alpha) p(h=1) + (E[s|h=0]^2 + 1./alpha) p(h=0)
         ss = from_h * (s1_mean**2 + s1_var) + (1-from_h) * (s0_mean**2 + s0_var)
-        tt = g * (t1_mean**2 + 1./self.beta_prec)  + (1-g) * (0 + 1./self.beta_prec)
+        tt = g * (t1_mean**2 + t1_var)  + (1-g) * (0 + t1_var)
         
         from_v = self.from_v(v)
         from_s = self.from_s(s)
@@ -549,13 +558,14 @@ class BilinearSpikeSlabRBM(Model, Block):
         cte = [g, t1_mu, h, s1_mu, s0_mu]
         return rval, cte
 
-    def lbound(self, g, t1_mu, t1_mean, h, s1_mu, s1_mean, s1_var,
-               s0_mu, s0_mean, s0_var, v,
-               s_stats_const=True, t_stats_const=True):
+    def lbound(self,
+               g, t1_mu, t1_mean, t1_var,
+               h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var,
+               v, s_stats_const=True, t_stats_const=True):
 
-        rval1, cte1 = self.lbound_plus(g, t1_mean, h,
-                s1_mean, s1_var, s0_mean, s0_var, v,
-                s_stats_const, t_stats_const)
+        rval1, cte1 = self.lbound_plus(g, t1_mean, t1_var,
+                h, s1_mean, s1_var, s0_mean, s0_var,
+                v, s_stats_const, t_stats_const)
 
         rval2, cte2 = self.entropy_term(g, t1_mu, h, s1_mu, s0_mu)
 
@@ -647,7 +657,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                                 n=1, p=g_mean, dtype=floatX)
         return g_sample
 
-    def t_given_gs(self, g_sample, s_sample):
+    def t_mu_given_gs(self, g_sample, s_sample):
         if self.flags['center_g']:
             g_sample = g_sample - self.cg
         from_s = self.from_s(s_sample)
@@ -658,14 +668,14 @@ class BilinearSpikeSlabRBM(Model, Block):
         """
         Generates sample from p(t | g, s)
         """
-        t_mean = self.t_given_gs(g_sample, s_sample)
+        t_mu = self.t_mu_given_gs(g_sample, s_sample)
         
         rng = self.theano_rng if rng is None else rng
         size = size if size else self.batch_size
         if self.flags['truncate_t']:
             t_sample = truncated.truncated_normal(
                     size=(size, self.n_g),
-                    avg = t_mean, 
+                    avg = t_mu, 
                     std = T.sqrt(1./self.beta_prec),
                     lbound = -self.truncation_bound['t'],
                     ubound = self.truncation_bound['t'],
@@ -674,7 +684,7 @@ class BilinearSpikeSlabRBM(Model, Block):
         else:
             t_sample = rng.normal(
                     size=(size, self.n_g),
-                    avg = t_mean, 
+                    avg = t_mu, 
                     std = T.sqrt(1./self.beta_prec),
                     dtype=floatX)
         return t_sample
@@ -731,22 +741,22 @@ class BilinearSpikeSlabRBM(Model, Block):
         s_mu = 1./self.alpha_prec * from_v * from_h + from_gt
         return s_mu
 
-    def s_stats(self, s_mu):
+    def trunc_stats(self, mu, sigma, a=None, b=None):
         """ WARNING: mean of a truncated gaussian is not the mu parameter ! """
-        s_mean = s_mu
-        s_var = T.tile(T.shape_padleft(1./self.alpha_prec), (self.batch_size, 1))
+        mean = mu
+        var = T.tile(T.shape_padleft(sigma**2), (self.batch_size, 1))
 
-        if self.flags['truncate_s']:
-            alpha = (-self.truncation_bound['s'] - s_mu) / self.alpha_sigma
-            beta  = (+self.truncation_bound['s'] - s_mu) / self.alpha_sigma
+        if a and b:
+            alpha = (a - mu) / sigma
+            beta  = (b - mu) / sigma
             Z = Phi(beta) - Phi(alpha)
-            s_mean += self.alpha_sigma * (phi(alpha) - phi(beta)) / Z
+            mean += sigma * (phi(alpha) - phi(beta)) / Z
 
-            s_var_term1 = (alpha * phi(alpha) - beta * phi(beta)) / Z
-            s_var_term2 = (phi(alpha) - phi(beta) / Z )**2
-            s_var *= (1 + s_var_term1 - s_var_term2)
+            var_term1 = (alpha * phi(alpha) - beta * phi(beta)) / Z
+            var_term2 = (phi(alpha) - phi(beta) / Z )**2
+            var *= (1 + var_term1 - var_term2)
 
-        return (s_mean, s_var)
+        return (mean, var)
 
     def sample_s_given_gthv(self, g_sample, t_sample, h_sample, v_sample, rng=None, size=None):
         """
@@ -815,48 +825,51 @@ class BilinearSpikeSlabRBM(Model, Block):
         :param init: dictionary of initial values
         :param n_steps: number of Gibbs updates to perform afterwards.
         """
-        def pos_mf_iteration(g, t1, h, s1_mu, s0_mu, v, pos_counter):
+        def pos_mf_iteration(g, t1_mu, h, s1_mu, s0_mu, v, pos_counter):
             """
             Mean-field computes the following statistics:
             E[h], E[s|h=1], E[s|h=0], E[s], E[g], E[t|g=1], E[t|g=0]=0.
             """
-   
+            s_low  = -self.truncation_bound['s'] if self.flags['truncate_s'] else None
+            s_high = +self.truncation_bound['s'] if self.flags['truncate_s'] else None
+            t_low  = -self.truncation_bound['t'] if self.flags['truncate_t'] else None
+            t_high = +self.truncation_bound['t'] if self.flags['truncate_t'] else None
+
             dummy = T.constant(0, dtype=floatX)
+
+            def dbg_track_lbound(g, t1_mu, h, s1_mu, s0_mu, v, i=0):
+                (s1_mean, s1_var) = self.trunc_stats(s1_mu, self.alpha_sigma, s_low, s_high)
+                (s0_mean, s0_var) = self.trunc_stats(s0_mu, self.alpha_sigma, s_low, s_high)
+                (t1_mean, t1_var) = self.trunc_stats(t1_mu, self.beta_sigma, t_low, t_high)
+                lbound, _crap = self.lbound(g, t1_mu, t1_mean, t1_var,
+                        h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var, v)
+                return Print('lbound%i'%i)(T.sum(lbound))
 
             ################# START ITERATION #############
             if self.flags['debug_inference']:
-                (_s1_mean, _s1_var) = self.s_stats(s1_mu)
-                (_s0_mean, _s0_var) = self.s_stats(s0_mu)
-                lbound, _crap = self.lbound(g, t1, t1, h, s1_mu, _s1_mean, _s1_var, s0_mu, _s0_mean, _s0_var, v)
-                dummy += Print('lbound0')(T.sum(lbound))
+                dummy += dbg_track_lbound(g, t1_mu, h, s1_mu, s0_mu, v, i=0)
+
+            (t1_mean, t1_var) = self.trunc_stats(t1_mu, self.beta_sigma, t_low, t_high)
 
             # (1) new_h := E[h=1]
-            new_h = self.h_given_gtv(g, t1, v)
+            new_h = self.h_given_gtv(g, t1_mean, v)
             if self.flags['debug_inference']:
-                (_s1_mean, _s1_var) = self.s_stats(s1_mu)
-                (_s0_mean, _s0_var) = self.s_stats(s0_mu)
-                lbound, _crap = self.lbound(g, t1, t1, new_h, s1_mu, _s1_mean, _s1_var, s0_mu, _s0_mean, _s0_var, v)
-                dummy += Print('lbound1')(T.sum(lbound))
+                dummy += dbg_track_lbound(g, t1_mu, new_h, s1_mu, s0_mu, v, i=1)
 
             # (2) p(s|h=1) := N(new_s1_mu, 1./self.alpha_prec)
-            new_s1_mu = self.s_mu_given_gthv(g, t1, T.ones((v.shape[0],  self.n_h)), v)
+            new_s1_mu = self.s_mu_given_gthv(g, t1_mean, T.ones((v.shape[0],  self.n_h)), v)
             if self.flags['debug_inference']:
-                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
-                (_s0_mean, _s0_var) = self.s_stats(s0_mu)
-                lbound, _crap = self.lbound(g, t1, t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, s0_mu, _s0_mean, _s0_var, v)
-                dummy += Print('lbound2')(T.sum(lbound))
+                dummy += dbg_track_lbound(g, t1_mu, new_h, new_s1_mu, s0_mu, v, i=2)
 
             # (3) p(s|h=0) := N(new_s0_mu, 1./self.alpha_prec)
-            new_s0_mu = self.s_mu_given_gthv(g, t1, T.zeros((v.shape[0], self.n_h)), v)
+            new_s0_mu = self.s_mu_given_gthv(g, t1_mean, T.zeros((v.shape[0], self.n_h)), v)
             if self.flags['debug_inference']:
-                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
-                (_new_s0_mean, _new_s0_var) = self.s_stats(new_s0_mu)
-                lbound, _crap = self.lbound(g, t1, t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, new_s0_mu, _new_s0_mean, _new_s0_var, v)
-                dummy += Print('lbound3')(T.sum(lbound))
+                dummy += dbg_track_lbound(g, t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=3)
 
             # IMPORTANT: for truncation gaussian, E[s1] != mu 
-            (new_s1_mean, new_s1_var) = self.s_stats(new_s1_mu)
-            (new_s0_mean, new_s0_var) = self.s_stats(new_s0_mu)
+            (new_s1_mean, new_s1_var) = self.trunc_stats(new_s1_mu, self.alpha_sigma, s_low, s_high)
+            (new_s0_mean, new_s0_var) = self.trunc_stats(new_s0_mu, self.alpha_sigma, s_low, s_high)
+
             # new_s := E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
             new_s = new_s1_mean * self.from_h(new_h, center=False) +\
                     new_s0_mean * (1-self.from_h(new_h, center=False))
@@ -864,27 +877,22 @@ class BilinearSpikeSlabRBM(Model, Block):
             # (4) new_g := E[g=1] 
             new_g = self.g_given_s(new_s)
             if self.flags['debug_inference']:
-                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
-                (_new_s0_mean, _new_s0_var) = self.s_stats(new_s0_mu)
-                lbound, _crap = self.lbound(new_g, t1, t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, new_s0_mu, _new_s0_mean, _new_s0_var, v)
-                dummy += Print('lbound4')(T.sum(lbound))
+                dummy += dbg_track_lbound(new_g, t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=4)
 
-            # (5) p(t|g=1) := N(new_t1, 1./self.beta_prec)
-            new_t1 = self.t_given_gs(T.ones((v.shape[0], self.n_g)), new_s)
+            # (5) p(t|g=1) := N(new_t1_mu, 1./self.beta_prec)
+            new_t1_mu = self.t_mu_given_gs(T.ones((v.shape[0], self.n_g)), new_s)
             if self.flags['debug_inference']:
-                (_new_s1_mean, _new_s1_var) = self.s_stats(new_s1_mu)
-                (_new_s0_mean, _new_s0_var) = self.s_stats(new_s0_mu)
-                lbound, _crap = self.lbound(new_g, new_t1, new_t1, new_h, new_s1_mu, _new_s1_mean, _new_s1_var, new_s0_mu, _new_s0_mean, _new_s0_var, v)
-                dummy += Print('lbound5')(T.sum(lbound))
-            ################# DONE ITERATION #############
+                dummy += dbg_track_lbound(new_g, new_t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=4)
 
-            # stopping criterion
-            dlbound_args = [new_g, new_t1, new_h,
-                            new_s1_mu, new_s1_mean, new_s1_var,
-                            new_s0_mu, new_s0_mean, new_s0_var, v]
+            # IMPORTANT: for truncation gaussian, E[t1] != mu 
+            (new_t1_mean, new_t1_var) = self.trunc_stats(new_t1_mu, self.beta_sigma, t_low, t_high)
+            ################# DONE ITERATION #############
 
             if self.flags['debug_inference']:
                 # ensure that derivative goes to 0 as bound gets tighter
+                dlbound_args = [new_g, new_t1_mu, new_t1_mean, new_t1_var,
+                                new_h, new_s1_mu, new_s1_mean, new_s1_var,
+                                new_s0_mu, new_s0_mean, new_s0_var, v]
                 dl_dghat = T.max(abs(self.dlbound_dg(*dlbound_args)))
                 dl_dhhat = T.max(abs(self.dlbound_dh(*dlbound_args)))
                 stop = T.maximum(Print('dl_dghat')(dl_dghat), Print('dl_dhhat')(dl_dhhat))
@@ -892,26 +900,30 @@ class BilinearSpikeSlabRBM(Model, Block):
                 # use value convergence as stopping criteria
                 stop = T.maximum(T.max(new_g - g),
                          T.maximum(T.max(new_h - h),
-                            T.maximum(T.max(new_t1 - t1),
+                            T.maximum(T.max(new_t1_mu - t1_mu),
                                 T.maximum(T.max(new_s1_mu - s1_mu),
                                           T.max(new_s0_mu - s0_mu)))))
 
-            return [new_g, new_t1, new_h, new_s1_mu, new_s0_mu,
-                    new_s1_mean, new_s1_var,
-                    new_s0_mean, new_s0_var, v,
+            return [new_g, new_t1_mu, new_t1_mean, new_t1_var,
+                    new_h, new_s1_mu, new_s1_mean, new_s1_var,
+                    new_s0_mu, new_s0_mean, new_s0_var, v,
                     pos_counter+1, dummy],\
                    theano.scan_module.until(stop < eps)
 
         states = [T.unbroadcast(T.shape_padleft(init_state['g'])),
-                  T.unbroadcast(T.shape_padleft(init_state['t'])),
+                  T.unbroadcast(T.shape_padleft(init_state['t1_mu'])),
+                  {'steps': 1},  # t1_mean
+                  {'steps': 1},  # t1_var
                   T.unbroadcast(T.shape_padleft(init_state['h'])),
                   T.unbroadcast(T.shape_padleft(init_state['s1_mu'])),
+                  {'steps': 1},  # s1_mean
+                  {'steps': 1},  # s1_var
                   T.unbroadcast(T.shape_padleft(init_state['s0_mu'])),
-                  {'steps': 1}, {'steps': 1},
-                  {'steps': 1}, {'steps': 1},
+                  {'steps': 1},  # s0_mean
+                  {'steps': 1},  # s0_var
                   T.unbroadcast(T.shape_padleft(v)),
-                  T.unbroadcast(T.shape_padleft(0.)),
-                  {'steps': 1}]
+                  T.unbroadcast(T.shape_padleft(0.)), # pos_counter
+                  {'steps': 1}] # dummy
 
         rvals, updates = scan(
                 pos_mf_iteration,
@@ -934,7 +946,7 @@ class BilinearSpikeSlabRBM(Model, Block):
             # start sampler from scratch
             init_state = OrderedDict()
             init_state['g'] = T.ones((v.shape[0], self.n_g)) * T.nnet.sigmoid(self.gbias)
-            init_state['t'] = T.zeros((v.shape[0], self.n_g))
+            init_state['t1_mu'] = T.zeros((v.shape[0], self.n_g))
             init_state['h'] = T.ones((v.shape[0], self.n_h)) * T.nnet.sigmoid(self.hbias)
             init_state['s1_mu'] = T.zeros((v.shape[0], self.n_s))
             init_state['s0_mu'] = T.zeros((v.shape[0], self.n_s))
@@ -944,24 +956,27 @@ class BilinearSpikeSlabRBM(Model, Block):
         # update running average of positive phase activations
         pos_updates = OrderedDict()
         pos_updates[self.odd_even] = (self.odd_even + 1) % 2
-        pos_updates[self.pos_g]  = rval[0]
-        pos_updates[self.pos_t1] = rval[1]
-        pos_updates[self.pos_h]  = rval[2]
-        pos_updates[self.pos_s1_mu] = rval[3]
-        pos_updates[self.pos_s0_mu] = rval[4]
-        pos_updates[self.pos_s1_mean] = rval[5]
-        pos_updates[self.pos_s1_var] = rval[6]
-        pos_updates[self.pos_s0_mean] = rval[7]
-        pos_updates[self.pos_s0_var] = rval[8]
-        # rval[9] is not used.
-        pos_updates[self.pos_counter] = rval[10]
-        pos_updates[self.lbound_temp] = rval[11]
+        pos_updates[self.pos_g]       = rval[0]
+        pos_updates[self.pos_t1_mu]   = rval[1]
+        pos_updates[self.pos_t1_mean] = rval[2]
+        pos_updates[self.pos_t1_var]  = rval[3]
+        pos_updates[self.pos_h]       = rval[4]
+        pos_updates[self.pos_s1_mu]   = rval[5]
+        pos_updates[self.pos_s1_mean] = rval[6]
+        pos_updates[self.pos_s1_var]  = rval[7]
+        pos_updates[self.pos_s0_mu]   = rval[8]
+        pos_updates[self.pos_s0_mean] = rval[9]
+        pos_updates[self.pos_s0_var]  = rval[10]
+        # v:=rval[11] is not used.
+        pos_updates[self.pos_counter] = rval[12]
+        pos_updates[self.lbound_temp] = rval[13]
 
         # TODO: move to statistics_updates
+        pos_g, pos_h = rval[0], rval[4]
         if self.flags['pos_phase_cg']:
-            pos_updates[self.cg] = T.cast(0.999 * self.cg + 0.001 * rval[0].mean(axis=0), floatX)
+            pos_updates[self.cg] = T.cast(0.999 * self.cg + 0.001 * pos_g.mean(axis=0), floatX)
         if self.flags['pos_phase_ch']:
-            pos_updates[self.ch] = T.cast(0.999 * self.ch + 0.001 * rval[2].mean(axis=0), floatX)
+            pos_updates[self.ch] = T.cast(0.999 * self.ch + 0.001 * pos_h.mean(axis=0), floatX)
 
         return pos_updates
 
@@ -1004,8 +1019,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         updates[self.neg_v] = rval[4]
         return updates
 
-    def ml_cost(self, pos_g, pos_t1, pos_h, pos_s1, pos_s1_var, pos_s0, pos_s0_var, pos_v,
-                      neg_g, neg_t, neg_h, neg_s, neg_v):
+    def ml_cost(self, pos_g, pos_t1_mean, pos_t1_var,
+                      pos_h, pos_s1_mean, pos_s1_var, pos_s0_mean, pos_s0_var,
+                      pos_v, neg_g, neg_t, neg_h, neg_s, neg_v):
         """
         Variational approximation to the maximum likelihood positive phase.
         :param v: T.matrix of shape (batch_size, n_v), training examples
@@ -1014,9 +1030,10 @@ class BilinearSpikeSlabRBM(Model, Block):
         # L(q) = pos_cost + neg_cost + H(q)
         # pos_cost := E_{q(g)q(h)} log p(g,h,v)
         # neg_cost := -log Z
-        pos_cost, pos_cte = self.lbound_plus(pos_g, pos_t1, pos_h,
-                pos_s1, pos_s1_var,
-                pos_s0, pos_s0_var, pos_v)
+        pos_cost, pos_cte = self.lbound_plus(
+                pos_g, pos_t1_mean, pos_t1_var,
+                pos_h, pos_s1_mean, pos_s1_var, pos_s0_mean, pos_s0_var,
+                pos_v)
 
         # - dlogZ/dtheta = E_p[ denergy / dtheta ]
         neg_cost, neg_cte = self.energy(neg_g, neg_t, neg_h, neg_s, neg_v)
@@ -1108,7 +1125,9 @@ class BilinearSpikeSlabRBM(Model, Block):
         chans.update(self.monitor_vector(self.lambd_prec, name='lambd_prec'))
         chans.update(self.monitor_matrix(self.pos_g))
         chans.update(self.monitor_matrix(self.pos_h))
-        chans.update(self.monitor_gauss(self.pos_t1))
+        chans.update(self.monitor_gauss(self.pos_t1_mu))
+        chans.update(self.monitor_gauss(self.pos_t1_mean))
+        chans.update(self.monitor_gauss(self.pos_t1_var))
         chans.update(self.monitor_gauss(self.pos_s1_mu))
         chans.update(self.monitor_gauss(self.pos_s1_mean))
         chans.update(self.monitor_gauss(self.pos_s0_mu))
@@ -1135,25 +1154,21 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return chans
 
-    def dlbound_dg(self, g, t1, h,
-                   s1_mu, s1_mean, s1_var,
-                   s0_mu, s0_mean, s0_var, v):
+    def dlbound_dg(self, g, t1_mu, t1_mean, t1_var,
+                   h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var, v):
 
-        lbound, cte = self.lbound(g, t1, t1, h,
-                s1_mu, s1_mean, s1_var,
-                s0_mu, s0_mean, s0_var, v, 
-                t_stats_const=False)
+        lbound, cte = self.lbound(g, t1_mu, t1_mean, t1_var,
+                h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var,
+                v, t_stats_const=False)
         dlbound_dg = T.grad(T.sum(lbound), [g], consider_constant=cte)[0]
         return  g * (1-g) * dlbound_dg
 
-    def dlbound_dh(self, g, t1, h,
-                   s1_mu, s1_mean, s1_var,
-                   s0_mu, s0_mean, s0_var, v):
+    def dlbound_dh(self, g, t1_mu, t1_mean, t1_var,
+                   h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var, v):
 
-        lbound, cte = self.lbound(g, t1, t1, h,
-                s1_mu, s1_mean, s1_var,
-                s0_mu, s0_mean, s0_var, v, 
-                s_stats_const=False)
+        lbound, cte = self.lbound(g, t1_mu, t1_mean, t1_var,
+                h, s1_mu, s1_mean, s1_var, s0_mu, s0_mean, s0_var,
+                v, s_stats_const=False)
         dlbound_dh = T.grad(T.sum(lbound), [h], consider_constant=cte)[0]
         return h * (1-h) * dlbound_dh
 
