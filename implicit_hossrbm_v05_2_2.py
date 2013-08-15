@@ -33,6 +33,28 @@ from utils import rbm_utils
 from utils import sharedX, floatX, npy_floatX
 from true_gradient import true_gradient
 
+"""
+class Print():
+    def __init__(self, *args, **kwargs):
+        pass
+    def __call__(self, x):
+        return x
+"""
+
+import scipy
+def _print_stats(op, xin):
+    print op.message, 'min: %.2f\t max: %.2f\t isnan:%i' % (
+        scipy.nanmin(xin),
+        scipy.nanmax(xin),
+        numpy.isnan(xin).any())
+
+    if op.message in ['beta', 'alpha']:
+        numpy.save('%s.npy' % op.message, xin)
+    if numpy.isnan(xin).any() or numpy.isinf(xin).any():
+        numpy.save('%s.npy' % op.message, xin)
+        if op.message == 'logz':
+            import pdb; pdb.set_trace()
+
 def sigm(x): return 1./(1 + numpy.exp(-x))
 def softplus(x): return numpy.log(1. + numpy.exp(x))
 def softplus_inv(x): return numpy.log(numpy.exp(x) - 1.)
@@ -44,20 +66,30 @@ def phi(x):
 def Phi(x):
     return 0.5 * (T.erf(x / T.sqrt(2.)) + 1.)
 
+def log_trunc_gauss_Z(mu, sigma, a, b):
+    alpha = Print('alpha', global_fn=_print_stats)((a - mu) / sigma)
+    beta  = Print('beta', global_fn=_print_stats)((b - mu) / sigma)
+    Z1 = Phi(beta) - Phi(alpha)
+    log_Z1 = Print('logz1', global_fn=_print_stats)(
+            T.log(Print('z1', global_fn=_print_stats)(Z1)))
+    log_Z2 = Print('logz2', global_fn=_print_stats)(T.Elemwise(truncated.log_trunc_norm_z)(alpha, beta))
+    log_Z = Print('logz', global_fn=_print_stats)(T.switch(T.eq(Z1, 0.), log_Z2, log_Z1))
+    return log_Z, (alpha, beta)
+
 def trunc_gauss_Z(mu, sigma, a, b):
     alpha = (a - mu) / sigma
     beta  = (b - mu) / sigma
-    Z = Phi(beta) - Phi(alpha)
-    return Z
+    Z1 = Phi(beta) - Phi(alpha)
+    Z2 = T.Elemwise(truncated.trunc_norm_z)(alpha, beta)
+    Z  = T.switch(T.gt(Z1, 1e-6), Z1, Z2)
+    return Z, (alpha, beta)
 
 def gauss_ent(mu, sigma, a=None, b=None):
     cte = npy_floatX(numpy.sqrt(2 * numpy.pi * numpy.exp(1)))
     if a is None and b is None:
         rval  = T.log(cte * sigma)
     else:
-        alpha = (a - mu) / sigma
-        beta  = (b - mu) / sigma
-        Z = Phi(beta) - Phi(alpha)
+        Z, (alpha, beta) = trunc_gauss_Z(mu, sigma, a, b)
         rval  = T.log(cte * sigma * Z)
         rval += (alpha * phi(alpha) - beta * phi(beta)) / (2*Z)
         rval -= (phi(alpha) - phi(beta))**2 / (2*Z**2)
@@ -459,6 +491,41 @@ class BilinearSpikeSlabRBM(Model, Block):
 
         return updates
 
+    def sanity_check(self, check_inference=True, check_params=True, check_whiten=True):
+        if check_inference:
+            assert not numpy.isnan(self.pos_g.get_value()).any()
+            assert not numpy.isnan(self.pos_t1_mu.get_value()).any()
+            assert not numpy.isnan(self.pos_t1_mean.get_value()).any()
+            assert not numpy.isnan(self.pos_t1_var.get_value()).any()
+            assert not numpy.isnan(self.pos_h.get_value()).any()
+            assert not numpy.isnan(self.pos_s1_mu.get_value()).any()
+            assert not numpy.isnan(self.pos_s1_mean.get_value()).any()
+            assert not numpy.isnan(self.pos_s1_var.get_value()).any()
+            assert not numpy.isnan(self.pos_s0_mu.get_value()).any()
+            assert not numpy.isnan(self.pos_s0_mean.get_value()).any()
+            assert not numpy.isnan(self.pos_s0_var.get_value()).any()
+            assert not numpy.isnan(self.cg.get_value()).any()
+            assert not numpy.isnan(self.ch.get_value()).any()
+
+        if check_params:
+            assert not numpy.isnan(self.Wg.get_value()).any()
+            assert not numpy.isnan(self.Wh.get_value()).any()
+            assert not numpy.isnan(self.Wv.get_value()).any()
+            assert not numpy.isnan(self.nu.get_value()).any()
+            assert not numpy.isnan(self.mu.get_value()).any()
+            assert not numpy.isnan(self.alpha.get_value()).any()
+            assert not numpy.isnan(self.beta.get_value()).any()
+            assert not numpy.isnan(self.gbias.get_value()).any()
+            assert not numpy.isnan(self.hbias.get_value()).any()
+
+        if check_standardize:
+            assert not numpy.isnan(self.gamma_s.get_value()).any()
+            assert not numpy.isnan(self.gamma_t.get_value()).any()
+            assert not (self.gamma_s.get_value() == 0).any()
+            assert not (self.gamma_t.get_value() == 0).any()
+            assert not numpy.isnan(self.linproj_v_std.get_value()).any()
+            assert not numpy.isnan(self.linproj_s_std.get_value()).any()
+
     def train_batch(self, dataset, batch_size):
 
         x = dataset.get_batch_design(batch_size, include_labels=False)
@@ -621,9 +688,13 @@ class BilinearSpikeSlabRBM(Model, Block):
         return T.dot(self.alpha_prec * s_sample, self._Wg)
 
     def from_gt(self, g_sample, t_sample, center=True):
+        temp = (self._nu + t_sample) * g_sample
         if center and self.flags['center_g']:
-            g_sample = g_sample - self.cg
-        return T.dot((self._nu + t_sample) * g_sample, self._Wg.T)
+            t_hat = g_sample * t_sample
+            temp -= t_hat * self.cg
+
+        g_sample = T.dot(temp, self._Wg.T)
+        return g_sample
 
     def from_h(self, h_sample, center=True):
         if center and self.flags['center_h']:
@@ -633,7 +704,7 @@ class BilinearSpikeSlabRBM(Model, Block):
     def to_h(self, h_s):
         return T.dot(h_s, self.Wh)
 
-    def g_given_s(self, s_sample):
+    def g_given_s(self, s_sample, eps=1e-6):
         from_s = self.from_s(s_sample) 
         g_mean = from_s * self._nu
         
@@ -642,7 +713,24 @@ class BilinearSpikeSlabRBM(Model, Block):
             squared_term *= (1 - 2*self.cg)
         g_mean += squared_term
 
+        if self.flags['truncate_t']:
+            b = self.truncation_bound['t']
+
+            g_ones  = T.ones((self.batch_size, self.n_g))
+            g_zeros = T.zeros((self.batch_size, self.n_g))
+            t_mu_g1 = self.t_mu_given_gs(g_ones, s_sample)
+            t_mu_g0 = self.t_mu_given_gs(g_zeros, s_sample)
+
+            log_Z_t1, _none = log_trunc_gauss_Z(Print('t_mu_g1',['min','max'])(t_mu_g1), Print('beta_sigma', ['min','max'])(self.beta_sigma), -b, b)
+            log_Z_t0, _none = log_trunc_gauss_Z(Print('t_mu_g0',['min','max'])(t_mu_g0), self.beta_sigma, -b, b)
+            g_mean += Print('log_Z_t1',['min','max'])(log_Z_t1) - Print('log_Z_t0',['min','max'])(log_Z_t0)
+            #g_mean = T.switch(
+                        #T.or_(T.lt(Z_t1, eps), T.lt(Z_t0, eps)),
+                        #g_mean,
+                        #g_mean + T.log(Z_t1 / Z_t0))
+
         g_mean += self.gbias
+
         return T.nnet.sigmoid(g_mean)
 
     def sample_g_given_s(self, s_sample, rng=None, size=None):
@@ -689,12 +777,10 @@ class BilinearSpikeSlabRBM(Model, Block):
                     dtype=floatX)
         return t_sample
 
-    def h_given_gtv(self, g_sample, t_sample, v_sample):
+    def h_given_gtv(self, g_sample, t_sample, v_sample, eps=1e-6):
         from_v = self.from_v(v_sample)
 
-        temp = self._mu + self.from_gt(g_sample, t_sample, center=False)
-        if self.flags['center_g']:
-            temp -= self.from_gt(self.cg, g_sample * t_sample, center=False)
+        temp = self._mu + self.from_gt(g_sample, t_sample)
         h_mean_s = from_v * temp
 
         squared_term = 0.5 * 1./self.alpha_prec * from_v**2
@@ -707,16 +793,16 @@ class BilinearSpikeSlabRBM(Model, Block):
 
             h_ones  = T.ones((self.batch_size, self.n_h))
             h_zeros = T.zeros((self.batch_size, self.n_h))
-            if self.flags['center_h']:
-                h_ones -= self.ch
-                h_zeros-= self.ch
-
             s_mu_h1 = self.s_mu_given_gthv(g_sample, t_sample, h_ones, v_sample)
             s_mu_h0 = self.s_mu_given_gthv(g_sample, t_sample, h_zeros, v_sample)
 
-            Z_s1 = trunc_gauss_Z(s_mu_h1, self.alpha_sigma, -b, b)
-            Z_s0 = trunc_gauss_Z(s_mu_h0, self.alpha_sigma, -b, b)
-            h_mean_s += T.log(Z_s1 / Z_s0)
+            log_Z_s1, _none = log_trunc_gauss_Z(Print('s_mu_h1',['min','max'])(s_mu_h1), self.alpha_sigma, -b, b)
+            log_Z_s0, _none = log_trunc_gauss_Z(Print('s_mu_h0',['min','max'])(s_mu_h0), self.alpha_sigma, -b, b)
+            h_mean_s += Print('log_Z_s1',['min','max'])(log_Z_s1) - Print('log_Z_s0',['min','max'])(log_Z_s0)
+            #h_mean_s = T.switch(
+                        #T.or_(T.lt(Z_s1, eps), T.lt(Z_s0, eps)),
+                        #h_mean_s,
+                        #h_mean_s + T.log(Z_s1 / Z_s0))
 
         h_mean = self.to_h(h_mean_s) + self.hbias
 
@@ -741,20 +827,24 @@ class BilinearSpikeSlabRBM(Model, Block):
         s_mu = 1./self.alpha_prec * from_v * from_h + from_gt
         return s_mu
 
-    def trunc_stats(self, mu, sigma, a=None, b=None):
+    def trunc_stats(self, mu, sigma, a=None, b=None, eps=1e-6):
         """ WARNING: mean of a truncated gaussian is not the mu parameter ! """
         mean = mu
         var = T.tile(T.shape_padleft(sigma**2), (self.batch_size, 1))
 
         if a and b:
-            alpha = (a - mu) / sigma
-            beta  = (b - mu) / sigma
-            Z = Phi(beta) - Phi(alpha)
-            mean += sigma * (phi(alpha) - phi(beta)) / Z
+            Z, (alpha, beta) = trunc_gauss_Z(mu, sigma, a, b)
 
-            var_term1 = (alpha * phi(alpha) - beta * phi(beta)) / Z
-            var_term2 = (phi(alpha) - phi(beta) / Z )**2
-            var *= (1 + var_term1 - var_term2)
+            _mean = mean + sigma * (phi(alpha) - phi(beta)) / (Z + eps)
+            mean = T.clip(_mean, a, b)
+
+            var_term1 = (alpha * phi(alpha) - beta * phi(beta)) / (Z + eps)
+            var_term2 = (phi(alpha) - phi(beta) / (Z + eps) )**2
+
+            var = T.switch(
+                    T.lt(Z, eps),
+                    0.,
+                    var * (1 + var_term1 - var_term2))
 
         return (mean, var)
 
@@ -849,10 +939,10 @@ class BilinearSpikeSlabRBM(Model, Block):
             if self.flags['debug_inference']:
                 dummy += dbg_track_lbound(g, t1_mu, h, s1_mu, s0_mu, v, i=0)
 
-            (t1_mean, t1_var) = self.trunc_stats(t1_mu, self.beta_sigma, t_low, t_high)
+            (t1_mean, t1_var) = self.trunc_stats(Print('t1_mu',['min','max'])(t1_mu), self.beta_sigma, t_low, t_high)
 
             # (1) new_h := E[h=1]
-            new_h = self.h_given_gtv(g, t1_mean, v)
+            new_h = self.h_given_gtv(Print('g',['min','max'])(g), Print('t1_mean',['min','max'])(t1_mean), v)
             if self.flags['debug_inference']:
                 dummy += dbg_track_lbound(g, t1_mu, new_h, s1_mu, s0_mu, v, i=1)
 
@@ -867,15 +957,15 @@ class BilinearSpikeSlabRBM(Model, Block):
                 dummy += dbg_track_lbound(g, t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=3)
 
             # IMPORTANT: for truncation gaussian, E[s1] != mu 
-            (new_s1_mean, new_s1_var) = self.trunc_stats(new_s1_mu, self.alpha_sigma, s_low, s_high)
-            (new_s0_mean, new_s0_var) = self.trunc_stats(new_s0_mu, self.alpha_sigma, s_low, s_high)
+            (new_s1_mean, new_s1_var) = self.trunc_stats(Print('new_s1_mu',['min','max'])(new_s1_mu), self.alpha_sigma, s_low, s_high)
+            (new_s0_mean, new_s0_var) = self.trunc_stats(Print('new_s0_mu',['min','max'])(new_s0_mu), self.alpha_sigma, s_low, s_high)
 
             # new_s := E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
-            new_s = new_s1_mean * self.from_h(new_h, center=False) +\
-                    new_s0_mean * (1-self.from_h(new_h, center=False))
+            new_s = Print('new_s1_mean',['min','max'])(new_s1_mean) * self.from_h(Print('new_h',['min','max'])(new_h), center=False) +\
+                    Print('new_s0_mean',['min','max'])(new_s0_mean) * (1-self.from_h(new_h, center=False))
 
             # (4) new_g := E[g=1] 
-            new_g = self.g_given_s(new_s)
+            new_g = self.g_given_s(Print('new_s',['min','max'])(new_s))
             if self.flags['debug_inference']:
                 dummy += dbg_track_lbound(new_g, t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=4)
 
@@ -904,10 +994,15 @@ class BilinearSpikeSlabRBM(Model, Block):
                                 T.maximum(T.max(new_s1_mu - s1_mu),
                                           T.max(new_s0_mu - s0_mu)))))
 
-            return [new_g, new_t1_mu, new_t1_mean, new_t1_var,
-                    new_h, new_s1_mu, new_s1_mean, new_s1_var,
-                    new_s0_mu, new_s0_mean, new_s0_var, v,
-                    pos_counter+1, dummy],\
+            new_pos_counter = (pos_counter + 1).astype(floatX)
+
+            return [new_g,
+                    new_t1_mu, new_t1_mean, new_t1_var,
+                    new_h,
+                    new_s1_mu, new_s1_mean, new_s1_var,
+                    new_s0_mu, new_s0_mean, new_s0_var,
+                    v,
+                    new_pos_counter, dummy],\
                    theano.scan_module.until(stop < eps)
 
         states = [T.unbroadcast(T.shape_padleft(init_state['g'])),
@@ -922,7 +1017,7 @@ class BilinearSpikeSlabRBM(Model, Block):
                   {'steps': 1},  # s0_mean
                   {'steps': 1},  # s0_var
                   T.unbroadcast(T.shape_padleft(v)),
-                  T.unbroadcast(T.shape_padleft(0.)), # pos_counter
+                  T.unbroadcast(T.shape_padleft(0.).astype(floatX)), # pos_counter
                   {'steps': 1}] # dummy
 
         rvals, updates = scan(
