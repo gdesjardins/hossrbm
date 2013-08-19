@@ -57,18 +57,22 @@ class TruncNormZ(BinaryScalarOp):
         return input
 
     def c_code(self, node, name, (a, b), (z,), sub):
-        d = locals()
-        d["self_compute_log"] = int(self.compute_log)
+        self_compute_log = int(self.compute_log)
         return """
          if (%(self_compute_log)s == 1) {
-             double K = %(a)s;
+             double K;
+             if (%(a)s > 0) {
+                K = %(a)s;
+             } else {
+                K = %(b)s;
+             }
              double temp = _adaptiveSimpsons(_truncSNormPDF, %(a)s, %(b)s, 1e-9, 4, K);
-             %(z)s = logf(temp) - K*K;
+             %(z)s = logf(temp) - 0.5 * K*K;
          }
          else {
              %(z)s = _adaptiveSimpsons(_truncSNormPDF, %(a)s, %(b)s, 1e-9, 4, 0);
          }
-         """ % d
+         """ % locals()
 
     def c_support_code(self):
         return (
@@ -84,7 +88,7 @@ class TruncNormZ(BinaryScalarOp):
 #define _TRUNCSNORMPDFFUNCDEFINED
 DEVICE double _truncSNormPDF(double x, double K) {
   double Z = sqrtf(2 * M_PI);
-  return 1/Z * expf(K*K - 0.5 * x*x);
+  return 1/Z * expf(0.5*K*K - 0.5 * x*x);
 }
 #endif
 
@@ -129,7 +133,7 @@ DEVICE double _adaptiveSimpsons(double (*f)(double, double),   // ptr to functio
 
 
     def c_code_cache_version(self):
-        return ()
+        return (1,)
 
     def grad(self, (a, b), (gz, )):
         raise utils.MethodNotDefined("grad", type(self),
@@ -140,7 +144,15 @@ DEVICE double _adaptiveSimpsons(double (*f)(double, double),   // ptr to functio
 
     def __eq__(self, other):
         return super(TruncNormZ, self).__eq__(other) and\
-               self.compute_log == other.compute_log 
+               (self.compute_log == other.compute_log)
 
 trunc_norm_z = TruncNormZ(upcast_out, name='trunc_norm_z')
-log_trunc_norm_z = TruncNormZ(upcast_out, name='trunc_norm_z', compute_log=True)
+
+
+class TruncNormLogZ(TruncNormZ):
+
+    def __init__(self, output_types_preference=None, name=None):
+        super(TruncNormLogZ, self).__init__(output_types_preference, name, compute_log=True)
+
+trunc_norm_log_z = TruncNormLogZ(upcast_out, name='trunc_norm_z')
+

@@ -67,13 +67,12 @@ def Phi(x):
     return 0.5 * (T.erf(x / T.sqrt(2.)) + 1.)
 
 def log_trunc_gauss_Z(mu, sigma, a, b):
-    alpha = Print('alpha', global_fn=_print_stats)((a - mu) / sigma)
-    beta  = Print('beta', global_fn=_print_stats)((b - mu) / sigma)
+    alpha = (a - mu) / sigma
+    beta  = (b - mu) / sigma
     Z1 = Phi(beta) - Phi(alpha)
-    log_Z1 = Print('logz1', global_fn=_print_stats)(
-            T.log(Print('z1', global_fn=_print_stats)(Z1)))
-    log_Z2 = Print('logz2', global_fn=_print_stats)(T.Elemwise(truncated.log_trunc_norm_z)(alpha, beta))
-    log_Z = Print('logz', global_fn=_print_stats)(T.switch(T.eq(Z1, 0.), log_Z2, log_Z1))
+    log_Z1 = T.log(Z1)
+    log_Z2 = T.Elemwise(truncated.trunc_norm_log_z)(alpha, beta)
+    log_Z = T.switch(T.eq(Z1, 0), log_Z2, log_Z1)
     return log_Z, (alpha, beta)
 
 def trunc_gauss_Z(mu, sigma, a, b):
@@ -721,9 +720,9 @@ class BilinearSpikeSlabRBM(Model, Block):
             t_mu_g1 = self.t_mu_given_gs(g_ones, s_sample)
             t_mu_g0 = self.t_mu_given_gs(g_zeros, s_sample)
 
-            log_Z_t1, _none = log_trunc_gauss_Z(Print('t_mu_g1',['min','max'])(t_mu_g1), Print('beta_sigma', ['min','max'])(self.beta_sigma), -b, b)
-            log_Z_t0, _none = log_trunc_gauss_Z(Print('t_mu_g0',['min','max'])(t_mu_g0), self.beta_sigma, -b, b)
-            g_mean += Print('log_Z_t1',['min','max'])(log_Z_t1) - Print('log_Z_t0',['min','max'])(log_Z_t0)
+            log_Z_t1, _none = log_trunc_gauss_Z(t_mu_g1, self.beta_sigma, -b, b)
+            log_Z_t0, _none = log_trunc_gauss_Z(t_mu_g0, self.beta_sigma, -b, b)
+            g_mean += log_Z_t1 - log_Z_t0
             #g_mean = T.switch(
                         #T.or_(T.lt(Z_t1, eps), T.lt(Z_t0, eps)),
                         #g_mean,
@@ -796,9 +795,9 @@ class BilinearSpikeSlabRBM(Model, Block):
             s_mu_h1 = self.s_mu_given_gthv(g_sample, t_sample, h_ones, v_sample)
             s_mu_h0 = self.s_mu_given_gthv(g_sample, t_sample, h_zeros, v_sample)
 
-            log_Z_s1, _none = log_trunc_gauss_Z(Print('s_mu_h1',['min','max'])(s_mu_h1), self.alpha_sigma, -b, b)
-            log_Z_s0, _none = log_trunc_gauss_Z(Print('s_mu_h0',['min','max'])(s_mu_h0), self.alpha_sigma, -b, b)
-            h_mean_s += Print('log_Z_s1',['min','max'])(log_Z_s1) - Print('log_Z_s0',['min','max'])(log_Z_s0)
+            log_Z_s1, _none = log_trunc_gauss_Z(s_mu_h1, self.alpha_sigma, -b, b)
+            log_Z_s0, _none = log_trunc_gauss_Z(s_mu_h0, self.alpha_sigma, -b, b)
+            h_mean_s += log_Z_s1 - log_Z_s0
             #h_mean_s = T.switch(
                         #T.or_(T.lt(Z_s1, eps), T.lt(Z_s0, eps)),
                         #h_mean_s,
@@ -939,10 +938,10 @@ class BilinearSpikeSlabRBM(Model, Block):
             if self.flags['debug_inference']:
                 dummy += dbg_track_lbound(g, t1_mu, h, s1_mu, s0_mu, v, i=0)
 
-            (t1_mean, t1_var) = self.trunc_stats(Print('t1_mu',['min','max'])(t1_mu), self.beta_sigma, t_low, t_high)
+            (t1_mean, t1_var) = self.trunc_stats(t1_mu, self.beta_sigma, t_low, t_high)
 
             # (1) new_h := E[h=1]
-            new_h = self.h_given_gtv(Print('g',['min','max'])(g), Print('t1_mean',['min','max'])(t1_mean), v)
+            new_h = self.h_given_gtv(g, t1_mean, v)
             if self.flags['debug_inference']:
                 dummy += dbg_track_lbound(g, t1_mu, new_h, s1_mu, s0_mu, v, i=1)
 
@@ -957,15 +956,15 @@ class BilinearSpikeSlabRBM(Model, Block):
                 dummy += dbg_track_lbound(g, t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=3)
 
             # IMPORTANT: for truncation gaussian, E[s1] != mu 
-            (new_s1_mean, new_s1_var) = self.trunc_stats(Print('new_s1_mu',['min','max'])(new_s1_mu), self.alpha_sigma, s_low, s_high)
-            (new_s0_mean, new_s0_var) = self.trunc_stats(Print('new_s0_mu',['min','max'])(new_s0_mu), self.alpha_sigma, s_low, s_high)
+            (new_s1_mean, new_s1_var) = self.trunc_stats(new_s1_mu, self.alpha_sigma, s_low, s_high)
+            (new_s0_mean, new_s0_var) = self.trunc_stats(new_s0_mu, self.alpha_sigma, s_low, s_high)
 
             # new_s := E[s|h=1] p(h=1) + E[s|h=0] p(h=0)
-            new_s = Print('new_s1_mean',['min','max'])(new_s1_mean) * self.from_h(Print('new_h',['min','max'])(new_h), center=False) +\
-                    Print('new_s0_mean',['min','max'])(new_s0_mean) * (1-self.from_h(new_h, center=False))
+            new_s = new_s1_mean * self.from_h(new_h, center=False) +\
+                    new_s0_mean * (1-self.from_h(new_h, center=False))
 
             # (4) new_g := E[g=1] 
-            new_g = self.g_given_s(Print('new_s',['min','max'])(new_s))
+            new_g = self.g_given_s(new_s)
             if self.flags['debug_inference']:
                 dummy += dbg_track_lbound(new_g, t1_mu, new_h, new_s1_mu, new_s0_mu, v, i=4)
 
